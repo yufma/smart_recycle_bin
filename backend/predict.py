@@ -1,17 +1,17 @@
-"""beta-1 분류 실행 스크립트 (4클래스: CAN, PET, GLASS, OTHER).
+"""beta-2 분류 실행 스크립트 (4클래스: CAN, PET, GLASS, OTHER).
 
 필요한 것: Python 3.9 이상, torch, torchvision, pillow, numpy (GPU 없어도 됨).
     pip install torch torchvision pillow numpy
 
 사용 예:
-    python predict.py --model beta-1b.pt 사진.jpg
-    python predict.py --model beta-1b.pt 사진폴더 --csv 결과.csv
-    python predict.py --model beta-1a.pt 원본.jpg --box 812,430,1260,1105
+    python predict.py --model beta-2b.pt 사진.jpg
+    python predict.py --model beta-2b.pt 사진폴더 --csv 결과.csv
+    python predict.py --model beta-2a.pt 원본.jpg --box 812,430,1260,1105
 
 입력 사진은 기기와 같은 구도(물체 1개가 가운데, 물체 상자가 화면의 35-45 %)여야 학습 때와 같은 조건이 됩니다.
 --box x0,y0,x1,y1 (원본 픽셀 좌표의 물체 상자)를 주면 학습 평가 때와 똑같은 40 % 구도(eval40)로 잘라서 분류합니다.
 전처리: EXIF 회전 반영, RGB, 비율 유지 224 리사이즈(bilinear) + 회색(114) 여백, ImageNet 평균/표준편차 정규화.
-GLASS 임계값: 1등이 GLASS인데 GLASS 확률이 임계값보다 낮으면 OTHER로 보냅니다 (beta-1a .55, beta-1b .60)."""
+GLASS 임계값: 1등이 GLASS인데 GLASS 확률이 임계값보다 낮으면 OTHER로 보냅니다 (beta-2a .65, beta-2b .70)."""
 import argparse, csv, io, math, sys
 from pathlib import Path
 import numpy as np, torch
@@ -20,7 +20,7 @@ from torchvision import transforms
 from torchvision.models import mobilenet_v2
 
 CLASSES = ['CAN', 'PET', 'GLASS', 'OTHER']
-GLASS_T = {'beta-1a': .55, 'beta-1b': .60}
+GLASS_T = {'beta-2a': .65, 'beta-2b': .70}
 TF = transforms.Compose([transforms.ToTensor(), transforms.Normalize([.485, .456, .406], [.229, .224, .225])])
 EXT = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
 
@@ -49,12 +49,12 @@ def load(path):
     m = mobilenet_v2(weights=None, num_classes=4); m.load_state_dict(ck['state_dict'], strict=True); return m.eval()
 
 def main():
-    a = argparse.ArgumentParser(description='beta-1 4클래스 분류'); a.add_argument('--model', required=True, help='beta-1a.pt 또는 beta-1b.pt')
+    a = argparse.ArgumentParser(description='beta-2 4클래스 분류'); a.add_argument('--model', required=True, help='beta-2a.pt 또는 beta-2b.pt')
     a.add_argument('images', nargs='+', help='사진 파일 또는 폴더'); a.add_argument('--box', help='x0,y0,x1,y1 (사진 1장일 때만)')
-    a.add_argument('--threshold', type=float, help='GLASS 임계값 (기본: beta-1a .55, beta-1b .60)'); a.add_argument('--csv', help='결과를 CSV로 저장')
+    a.add_argument('--threshold', type=float, help='GLASS 임계값 (기본: beta-2a .65, beta-2b .70)'); a.add_argument('--csv', help='결과를 CSV로 저장')
     a.add_argument('--cpu', action='store_true', help='GPU가 있어도 CPU로 실행'); a = a.parse_args()
     t = a.threshold if a.threshold is not None else GLASS_T.get(Path(a.model).stem)
-    if t is None: sys.exit('모델 이름이 beta-1a / beta-1b가 아니면 --threshold를 지정해 주세요')
+    if t is None: sys.exit('모델 이름이 beta-2a / beta-2b가 아니면 --threshold를 지정해 주세요')
     files = []
     for p in map(Path, a.images): files += sorted(f for f in p.rglob('*') if f.suffix.lower() in EXT) if p.is_dir() else [p]
     box = [float(v) for v in a.box.split(',')] if a.box else None
