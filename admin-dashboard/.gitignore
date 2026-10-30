@@ -17,3 +17,10 @@ logs/
 *.pem
 *.key
 .DS_Store
+
+# Android app build output
+android/.gradle/
+android/build/
+android/app/build/
+android/dist/
+android/local.properties

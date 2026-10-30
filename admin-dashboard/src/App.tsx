@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
 import { ArrowRight, ArrowUpRight, Bell, Building2, Check, ChevronDown, ChevronRight, CircleHelp, Clock3, Database, LayoutDashboard, Leaf, Loader2, LogOut, MapPinned, Menu, Radio, Route as RouteIcon, Settings, ShieldCheck, Sparkles, Users, X, History, Wifi, AlertCircle, RefreshCw } from 'lucide-react';
-import { api, payload, dateTime, sourceText, statusText } from './types';
-import type { Bin, Page, Workspace } from './types';
-import { Badge, BinArt, Dialog, Logo } from './UI';
+import { api, compartmentName, compartments, payload, dateTime, fillText, sourceText, statusText, toEmpty, topCompartment } from './types';
+import type { Bin, Fills, Page, Workspace } from './types';
+import { Badge, BinArt, CompartmentRow, Dialog, Logo } from './UI';
 import { Dashboard, RoutePanel } from './Dashboard';
 import { BuildingEditor, DevicePage, HistoryPage, SettingsPage, TeamPage } from './Pages';
 
@@ -46,15 +46,20 @@ function Auth({ onLogin }: { onLogin: () => Promise<void> }) {
 }
 
 function BinDetails({ bin, s, mutate, busy, onClose, navigate }: { bin: Bin; s: Workspace; mutate: PageProps['mutate']; busy: boolean; onClose: () => void; navigate: (p: Page) => void }) {
-  const [fill, setFill] = useState(bin.fill ?? 0);
-  useEffect(() => setFill(bin.fill ?? 0), [bin.id, bin.fill]);
+  const saved = JSON.stringify(bin.compartments); // the workspace refresh replaces the object every 5 seconds
+  const [fills, setFills] = useState<Fills>(bin.compartments);
+  useEffect(() => setFills(JSON.parse(saved)), [bin.id, saved]);
+  const top = topCompartment(bin.compartments);
+  const emptied = toEmpty(bin.compartments, s.building);
   const route = s.last_plan?.routes.find(r => r.bin_ids.includes(bin.id));
   const readings = s.readings.filter(r => r.bin_id === bin.id && r.fill !== null).slice(0, 12).reverse();
-  return <Dialog title={bin.id} subtitle={`${bin.floor}층 ${bin.name} · ${bin.category}`} onClose={onClose}>
-    <div className="bin-detail-hero"><BinArt fill={bin.fill} status={bin.status} large /><div><Badge status={bin.status} /><div className="detail-fill">{bin.fill === null ? '—' : Math.round(bin.fill)}<small>%</small></div><span className="source-label">{sourceText[bin.reading_source]}</span></div></div>
-    <div className="detail-info"><div><span>마지막 측정</span><strong>{dateTime(bin.measured_at)}</strong></div><div><span>담당 관리자</span><strong>{route ? `관리자 ${route.worker}` : '경로 배정 전'}</strong></div><div><span>수거 기준</span><strong>{s.building.critical_threshold}% 이상</strong></div></div>
-    {bin.device_type === 'demo' ? <div className="detail-slider"><div><strong>더미 적재율 조절</strong><span>{fill}%</span></div><input type="range" min="0" max="100" value={fill} onChange={e => setFill(+e.target.value)} aria-label="더미 적재율" /><div className="range-labels"><span>비어 있음</span><span>가득 참</span></div><button className="button secondary full" disabled={busy || fill === bin.fill} onClick={() => mutate(`/bins/${bin.id}`, { fill }, 'PATCH', '적재율이 변경되었습니다.')}>적재율 적용</button></div> : <div className="notice"><Radio size={17} /><div>{bin.reading_source === 'actual' ? '실물 센서에서 수신한 값입니다. 수거 완료 후 다음 센서값으로 비워진 상태를 확인합니다.' : '장치 연동 화면에서 센서를 연결하거나 시뮬레이션으로 상태 변화를 확인할 수 있습니다.'}<button className="text-link" onClick={() => { onClose(); navigate('device'); }}>장치 연동 열기<ArrowUpRight size={14} /></button></div></div>}
+  return <Dialog title={bin.id} subtitle={`${bin.floor}층 ${bin.name}`} onClose={onClose}>
+    <div className="bin-detail-hero"><BinArt fill={bin.fill} status={bin.status} large /><div><Badge status={bin.status} /><div className="detail-fill">{bin.fill === null ? '—' : Math.round(bin.fill)}<small>%</small></div><span className="source-label">{top ? `가장 찬 칸 ${compartmentName[top]} · ` : ''}{sourceText[bin.reading_source]}</span></div></div>
+    <CompartmentRow values={bin.compartments} building={s.building} large />
+    <div className="detail-info"><div><span>마지막 측정</span><strong>{dateTime(bin.measured_at)}</strong></div><div><span>담당 관리자</span><strong>{route ? `관리자 ${route.worker}` : '경로 배정 전'}</strong></div><div><span>수거 기준</span><strong>칸별 {s.building.critical_threshold}% 이상</strong></div></div>
+    {bin.device_type === 'demo' ? <div className="detail-slider"><div><strong>더미 적재율 조절</strong><span>칸별</span></div>{compartments.map(c => <label key={c} className="compartment-slider"><span>{compartmentName[c]}</span><input type="range" min="0" max="100" value={fills[c] ?? 0} onChange={e => setFills({ ...fills, [c]: +e.target.value })} aria-label={`${compartmentName[c]} 칸 더미 적재율`} /><b>{fills[c] ?? 0}%</b></label>)}<button className="button secondary full" disabled={busy || JSON.stringify(fills) === saved} onClick={() => mutate(`/bins/${bin.id}`, { fills }, 'PATCH', '적재율이 변경되었습니다.')}>적재율 적용</button></div> : <div className="notice"><Radio size={17} /><div>{bin.reading_source === 'actual' ? '실물 센서에서 수신한 값입니다. 수거 완료 후 다음 센서값으로 비워진 상태를 확인합니다.' : '장치 연동 화면에서 센서를 연결하거나 시뮬레이션으로 상태 변화를 확인할 수 있습니다.'}<button className="text-link" onClick={() => { onClose(); navigate('device'); }}>장치 연동 열기<ArrowUpRight size={14} /></button></div></div>}
     {readings.length > 1 && <div className="reading-spark"><span>최근 수신 추이</span><svg viewBox="0 0 400 90" role="img" aria-label="최근 적재율 추이"><path d="M 0 80 H 400 M 0 40 H 400" stroke="#e8ede7" strokeDasharray="4 4" /><polyline points={readings.map((r, i) => `${i * 400 / (readings.length - 1)},${80 - (r.fill ?? 0) * .7}`).join(' ')} stroke="#508264" fill="none" strokeWidth="3" /></svg></div>}
+    {bin.fill !== null && bin.fill > 0 && <p className="muted-note empty-note">수거 완료 시 비우는 칸: {fillText(emptied)}</p>}
     <div className="modal-actions"><button className="button secondary" onClick={onClose}>닫기</button><button className="button primary" disabled={busy || bin.fill === null || bin.awaiting_confirmation || bin.status === 'offline' || bin.fill === 0} onClick={async () => { const result = await mutate(`/collect/${bin.id}`, { worker: route?.worker ?? null }, 'POST', '수거 완료를 기록했습니다.'); if (result) onClose(); }}><Check size={16} /> 수거 완료</button></div>
   </Dialog>;
 }
