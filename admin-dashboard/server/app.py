@@ -854,10 +854,11 @@ def calculate_plan(state: dict) -> dict:
     def value_of(span, total, used, preset):
         # fastest: finish time, then total time; the cap needs no term, because the earliest finish
         # keeps everyone under it whenever that is possible. lean: the worst overrun of the cap first,
-        # then the number of workers, then total time.
+        # then the number of workers, then total time, then finish time (splits of the same total
+        # are common, and without it the one kept depended on the search's starting point).
         if preset == "fastest":
             return span + 0.001 * total
-        return 1e7 * max(0.0, span - limit) + 1e5 * used + total
+        return 1e7 * max(0.0, span - limit) + 1e5 * used + total + 0.001 * span
 
     def score(routes, preset):
         times = [evaluate(r)[0] for r in routes if r]

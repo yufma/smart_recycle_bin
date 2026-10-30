@@ -171,7 +171,7 @@ def brute_force(state, targets, workers):
         groups = [frozenset(t for t, o in zip(targets, owner) if o == w) for w in range(workers)]
         spans = [best_route[g] for g in groups if g]
         fast_value = (round(max(spans), 6), round(sum(spans), 6))
-        lean_value = (round(max(0.0, max(spans) - limit), 6), len(spans), round(sum(spans), 6))
+        lean_value = (round(max(0.0, max(spans) - limit), 6), len(spans), round(sum(spans), 6), round(max(spans), 6))
         fastest = fast_value if fastest is None or fast_value < fastest else fastest
         lean = lean_value if lean is None or lean_value < lean else lean
     return fastest, lean
@@ -181,12 +181,13 @@ def test_presets_match_exhaustive_search(client):
     state = client.post("/api/plan", json={"include_orange": True, "available_staff": 3, "route_mode": "fastest"}).json()
     fast = state["last_plan"]
     assert state["building"]["route_mode"] == fast["mode"] == "fastest"
-    (span, total), (overrun, used, lean_total) = brute_force(state, fast["target_ids"], 3)
+    (span, total), (overrun, used, lean_total, lean_span) = brute_force(state, fast["target_ids"], 3)
     assert fast["makespan_seconds"] == round(span)
     assert fast["total_seconds"] == pytest.approx(total, abs=len(fast["routes"]))
     lean = client.post("/api/plan", json={"route_mode": "lean"}).json()["last_plan"]
     assert lean["mode"] == "lean" and overrun == 0
     assert len(lean["routes"]) == used and lean["total_seconds"] == pytest.approx(lean_total, abs=used)
+    assert lean["makespan_seconds"] == round(lean_span)
     assert all(not r["over_limit"] and r["duration_seconds"] <= 20 * 60 for r in lean["routes"])
     assert fast["comparison"] == lean["comparison"]
     assert fast["makespan_seconds"] <= lean["makespan_seconds"] and len(lean["routes"]) <= len(fast["routes"])
@@ -216,6 +217,19 @@ def test_many_stops_and_input_validation(client):
     assert building["route_mode"] == "fastest" and "route_slack_percent" not in building
     assert building["stairs_up_seconds"] == backend.ROUTE_DEFAULTS["stairs_up_seconds"]
     assert client.post("/api/restore", json=client.get("/api/backup").json()).status_code == 200
+
+
+def test_lean_result_does_not_depend_on_spare_staff(client):
+    # the same three workers whether three, four or five are available: equal totals are settled by
+    # the finish time, not by where the search happened to start
+    state = client.post("/api/demo/reset", json={"template": "large"}).json()
+    results = set()
+    for staff in (3, 4, 5):
+        plan = backend.calculate_plan(state | {"building": state["building"] | {"available_staff": staff, "include_orange": True,
+                                                                                 "route_mode": "lean"}})
+        lean = plan["comparison"]["lean"]
+        results.add((lean["workers"], lean["makespan_seconds"], lean["total_seconds"]))
+    assert len(results) == 1 and next(iter(results))[0] == 3
 
 
 def test_large_sample_building_has_floor_plans_several_cores_and_both_presets(client):
