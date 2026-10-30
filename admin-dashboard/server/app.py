@@ -9,9 +9,11 @@ import hmac
 import json
 import math
 import os
+import random
 import secrets
 import sqlite3
 import threading
+import time
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -20,6 +22,9 @@ from typing import Any, Literal, Optional
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
+
+from .sample_layout import (LARGE_BINS, LARGE_CORES, LARGE_CORRIDOR_X, LARGE_CORRIDORS, LARGE_FILLS, LARGE_FLOORS,
+                            LARGE_OFFICE, LARGE_ROOMS, large_room_label)
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = Path(os.environ.get("RELOOP_DATA_DIR", str(ROOT / "data")))
@@ -30,6 +35,20 @@ COOKIE = "reloop_session"
 DEMO_EMAIL = "demo@reloop.local"
 DEMO_PASSWORD = "Demo1234!"
 ROUTE_COLORS = ["#3976db", "#9266ce", "#1d9caa", "#bf648f", "#6073a3", "#9b7946"]
+# Route presets. fastest: the earliest time by which every collection is done; lean: the fewest
+# workers, then the least total working time. Both keep within the cart capacity and the per-person
+# working-time cap, and end each trip at the drop-off point (분리수거장, or the office if none is set).
+RouteMode = Literal["fastest", "lean"]
+# Travel-time defaults are assumptions to be replaced by on-site measurements.
+ROUTE_DEFAULTS = {"route_mode": "fastest", "stairs_up_seconds": 20, "stairs_down_seconds": 14,
+                  "elevator_wait_seconds": 40, "elevator_floor_seconds": 4, "use_cart": False,
+                  "cart_capacity": 4, "depot_node": "", "unload_seconds": 60, "max_work_minutes": 20}
+CART_SPEED_RATIO = 0.85  # walking speed with a loaded cart
+CAR = "~car"  # suffix of the car twin of each lift node
+# Search effort per preset: up to SEARCH_RESTARTS runs of base rounds plus rounds per stop, within a
+# time budget in seconds.
+SEARCH_ROUNDS, SEARCH_ROUNDS_PER_STOP, SEARCH_SECONDS, SEARCH_RESTARTS = 600, 20, 0.6, 4
+SEARCH_HEAT = 0.01  # starting annealing temperature as a share of the first plan's time
 
 
 def now() -> str:
@@ -95,7 +114,7 @@ def new_workspace() -> dict:
                          "awaiting_confirmation": False})
     return {
         "building": {"name": "인하대학교 · 미래관", "floors": 3,
-                     "total_staff": 3, "available_staff": 2, "include_orange": False,
+                     "total_staff": 3, "available_staff": 2, "include_orange": False, **ROUTE_DEFAULTS, "depot_node": "F1-N4",
                      "office_floor": 1, "office_x": 10, "office_y": 78,
                      "office_access_node": "F1-N0", "meters_per_unit": 0.6,
                      "speed_mps": 1.0, "service_seconds": 45,
@@ -105,6 +124,60 @@ def new_workspace() -> dict:
         "map_images": {}, "logs": [], "readings": [], "last_plan": None,
         "device_key_hint": None, "revision": 1, "updated_at": stamp,
     }
+
+
+# Floor plans drawn by tools/make_large_floorplans.py for the large sample building.
+SAMPLE_DIR = ROOT / "server" / "samples"
+
+
+def large_workspace() -> dict:
+    state = new_workspace()
+    nodes, edges, bins = [], [], []
+    stamp = state["updated_at"]
+    for floor in range(1, LARGE_FLOORS + 1):
+        for side, y, name in LARGE_CORRIDORS:
+            for index, x in enumerate(LARGE_CORRIDOR_X):
+                nodes.append({"id": f"F{floor}-{side}{index}", "floor": floor, "x": x, "y": y,
+                              "kind": "corridor", "label": f"{name} 복도 {index + 1}"})
+                if index:
+                    edges.append({"id": f"E{floor}-{side}{index}", "from": f"F{floor}-{side}{index-1}",
+                                  "to": f"F{floor}-{side}{index}", "distance_m": None})
+        for core, x, kind, label, rise in LARGE_CORES:
+            node_id = f"F{floor}-{core}"
+            index = LARGE_CORRIDOR_X.index(x)
+            nodes.append({"id": node_id, "floor": floor, "x": x, "y": 50, "kind": kind, "label": label})
+            edges += [{"id": f"E{floor}-{core}-N", "from": f"F{floor}-N{index}", "to": node_id, "distance_m": None},
+                      {"id": f"E{floor}-{core}-S", "from": node_id, "to": f"F{floor}-S{index}", "distance_m": None}]
+            if floor > 1:
+                edges.append({"id": f"{core}-{floor}", "from": f"F{floor-1}-{core}", "to": node_id, "distance_m": rise})
+        for index, (x, y, access, room) in enumerate(LARGE_BINS):
+            number = (floor - 1) * len(LARGE_BINS) + index + 1
+            bins.append({"id": f"B-{number:03}", "name": f"{large_room_label(LARGE_ROOMS[room], floor)} 앞",
+                         "floor": floor, "x": x, "y": y, "access_node": f"F{floor}-{access}",
+                         "category": ["PET", "캔", "일반", "혼합"][index % 4],
+                         "fill": LARGE_FILLS[floor-1][index], "device_type": "real" if number == 1 else "demo",
+                         "reading_source": "unconnected" if number == 1 else "demo",
+                         "measured_at": None if number == 1 else stamp,
+                         "received_at": None if number == 1 else stamp, "awaiting_confirmation": False})
+    office_x, office_y, office_access = LARGE_OFFICE
+    state["building"].update(name="예시 캠퍼스 · 종합관", floors=LARGE_FLOORS, total_staff=5, available_staff=3,
+                             office_x=office_x, office_y=office_y, office_access_node=f"F1-{office_access}",
+                             meters_per_unit=0.8, depot_node="F1-S4")
+    state.update(bins=bins, graph={"nodes": nodes, "edges": edges})
+    return state
+
+
+def sample_floorplans(template: str) -> dict:
+    if template != "large":
+        return {}
+    images = {}
+    for floor in range(1, LARGE_FLOORS + 1):
+        source = SAMPLE_DIR / f"large-floor-{floor}.png"
+        if source.is_file():
+            name = f"sample-large-{floor}.png"
+            (MAP_DIR / name).write_bytes(source.read_bytes())
+            images[str(floor)] = name
+    return images
 
 
 def init_db():
@@ -177,7 +250,15 @@ def read_workspace(db, user_id: int) -> dict:
     row = db.execute("SELECT state_json FROM workspaces WHERE user_id=?", (user_id,)).fetchone()
     if not row:
         raise HTTPException(404, "건물 정보를 찾을 수 없습니다.")
-    return json.loads(row[0])
+    state = json.loads(row[0])
+    building = state["building"]
+    # Workspaces saved before the travel-time model get its defaults; retired route modes fall back.
+    building.pop("route_slack_percent", None)
+    for key, value in ROUTE_DEFAULTS.items():
+        building.setdefault(key, value)
+    if building["route_mode"] not in ("fastest", "lean"):
+        building["route_mode"] = ROUTE_DEFAULTS["route_mode"]
+    return state
 
 
 def save_workspace(db, user_id: int, state: dict):
@@ -302,6 +383,16 @@ class ConfigPatch(StrictModel):
     total_staff: Optional[int] = Field(default=None, ge=1, le=12)
     available_staff: Optional[int] = Field(default=None, ge=0, le=12)
     include_orange: Optional[bool] = None
+    route_mode: Optional[RouteMode] = None
+    stairs_up_seconds: Optional[float] = Field(default=None, ge=1, le=300, allow_inf_nan=False)
+    stairs_down_seconds: Optional[float] = Field(default=None, ge=1, le=300, allow_inf_nan=False)
+    elevator_wait_seconds: Optional[float] = Field(default=None, ge=0, le=600, allow_inf_nan=False)
+    elevator_floor_seconds: Optional[float] = Field(default=None, ge=0.5, le=120, allow_inf_nan=False)
+    use_cart: Optional[bool] = None
+    cart_capacity: Optional[float] = Field(default=None, ge=0, le=50, allow_inf_nan=False)
+    depot_node: Optional[str] = Field(default=None, max_length=50)
+    unload_seconds: Optional[int] = Field(default=None, ge=0, le=600)
+    max_work_minutes: Optional[int] = Field(default=None, ge=0, le=480)
     office_floor: Optional[int] = Field(default=None, ge=1, le=10)
     office_x: Optional[float] = Field(default=None, ge=0, le=100, allow_inf_nan=False)
     office_y: Optional[float] = Field(default=None, ge=0, le=100, allow_inf_nan=False)
@@ -327,6 +418,10 @@ def validate_config(state: dict):
     node = next((n for n in state["graph"]["nodes"] if n["id"] == cfg["office_access_node"]), None)
     if node and node["floor"] != cfg["office_floor"]:
         raise HTTPException(422, "관리자실과 연결 통로는 같은 층이어야 합니다.")
+    if 0 < cfg["cart_capacity"] < 1:
+        raise HTTPException(422, "한 번에 옮길 양은 0(제한 없음) 또는 가득 찬 통 1개 이상이어야 합니다.")
+    if cfg["depot_node"] and all(n["id"] != cfg["depot_node"] for n in state["graph"]["nodes"]):
+        raise HTTPException(422, "분리수거장으로 지정한 통로 지점을 찾을 수 없습니다.")
 
 
 @app.patch("/api/config")
@@ -476,6 +571,8 @@ def update_graph(body: Graph, user=Depends(current_user)):
         graph = body.model_dump(by_alias=True)
         validate_graph(graph, state["building"]["floors"])
         state["graph"] = graph
+        if all(n["id"] != state["building"]["depot_node"] for n in graph["nodes"]):
+            state["building"]["depot_node"] = ""  # the drop-off point was removed: trips end at the office
         return result_for(db, user, state)
 
 
@@ -499,6 +596,10 @@ def build_graph(state: dict):
         connect(a["id"], b["id"], max(distance, 0.01))
     points = [{"id": "OFFICE", "floor": config["office_floor"], "x": config["office_x"],
                "y": config["office_y"], "access_node": config["office_access_node"], "kind": "office"}] + state["bins"]
+    depot = nodes.get(config.get("depot_node") or "")
+    if depot:  # the drop-off point sits on its graph node
+        points.append({"id": "DEPOT", "floor": depot["floor"], "x": depot["x"], "y": depot["y"],
+                       "access_node": depot["id"], "kind": "depot"})
     for point in points:
         nodes[point["id"]] = dict(point)
         adjacency[point["id"]] = []
@@ -524,109 +625,330 @@ def dijkstra(adjacency: dict, start: str):
     return distances, previous
 
 
+def travel_graph(state: dict):
+    """Directed travel times between points, in seconds, with the walking metres of each step.
+
+    Corridors cost metres / walking speed. Stairs cost a time per floor that differs going up and
+    down. A lift ride costs one boarding wait plus a time per floor: every lift node gets a twin car
+    node, so walking past the lift door costs nothing and the wait is paid once per ride. With a
+    cart the stairs are closed and walking is slower."""
+    config = state["building"]
+    nodes, adjacency = build_graph(state)
+    cart = config["use_cart"]
+    speed = config["speed_mps"] * (CART_SPEED_RATIO if cart else 1)
+    arcs = {key: [] for key in nodes}
+    for key, node in list(nodes.items()):
+        if node.get("kind") == "elevator":
+            nodes[key + CAR] = dict(node, id=key + CAR)
+            arcs[key + CAR] = [(key, 0.0, 0.0)]
+            arcs[key].append((key + CAR, config["elevator_wait_seconds"], 0.0))
+    for a, links in adjacency.items():
+        for b, metres in links:
+            here, there = nodes[a], nodes[b]
+            rise = there["floor"] - here["floor"]
+            if not rise:
+                arcs[a].append((b, metres / speed, metres))
+            elif here.get("kind") == "elevator":
+                arcs[a + CAR].append((b + CAR, abs(rise) * config["elevator_floor_seconds"], 0.0))
+            elif not cart:
+                seconds = rise * config["stairs_up_seconds"] if rise > 0 else -rise * config["stairs_down_seconds"]
+                arcs[a].append((b, seconds, metres))
+    return nodes, arcs
+
+
+def fastest_paths(arcs: dict, start: str):
+    seconds, metres, previous = {start: 0.0}, {start: 0.0}, {}
+    queue = [(0.0, start)]
+    while queue:
+        elapsed, node = heapq.heappop(queue)
+        if elapsed > seconds[node]:
+            continue
+        for target, cost, length in arcs[node]:
+            value = elapsed + cost
+            if value < seconds.get(target, math.inf) - 1e-9:
+                seconds[target], metres[target], previous[target] = value, metres[node] + length, node
+                heapq.heappush(queue, (value, target))
+    return seconds, metres, previous
+
+
 def calculate_plan(state: dict) -> dict:
     config = state["building"]
     selected = [b for b in state["bins"] if bin_status(b, config) == "critical" or
                 (config["include_orange"] and bin_status(b, config) == "warning")]
-    nodes, adjacency = build_graph(state)
-    distances, predecessors = {}, {}
-    for source in ["OFFICE"] + [b["id"] for b in selected]:
-        distances[source], predecessors[source] = dijkstra(adjacency, source)
-    unreachable = [b["id"] for b in selected if b["id"] not in distances["OFFICE"]]
+    nodes, arcs = travel_graph(state)
+    end = "DEPOT" if "DEPOT" in nodes else "OFFICE"
+    seconds, metres, previous = {}, {}, {}
+    for source in dict.fromkeys(["OFFICE", end] + [b["id"] for b in selected]):
+        seconds[source], metres[source], previous[source] = fastest_paths(arcs, source)
+    unreachable = [b["id"] for b in selected if b["id"] not in seconds["OFFICE"] or end not in seconds[b["id"]]]
     targets = [b["id"] for b in selected if b["id"] not in unreachable]
+    if end not in seconds["OFFICE"]:
+        unreachable, targets = [b["id"] for b in selected], []
+    load = {b["id"]: (b["fill"] or 0) / 100 for b in selected}
     workers = min(config["available_staff"], len(targets))
-    assignments: list[list[str]] = [[] for _ in range(workers)]
-    speed, service = config["speed_mps"], config["service_seconds"]
+    mode = config.get("route_mode", ROUTE_DEFAULTS["route_mode"])
+    capacity = config["cart_capacity"] or math.inf
+    limit = config["max_work_minutes"] * 60 or math.inf
+    service, unload = config["service_seconds"], config["unload_seconds"]
+    cache: dict[tuple, tuple] = {}
+    # Same inputs, same plan: the search is seeded from everything but the chosen preset.
+    seed = route_signature(dict(state, building={k: v for k, v in config.items() if k != "route_mode"}))
 
-    def length(route):
-        if not route:
-            return 0.0
-        sequence = ["OFFICE"] + route + ["OFFICE"]
-        return sum(distances[a][b] for a, b in zip(sequence, sequence[1:]))
+    def evaluate(route):
+        # Seconds, walking metres and unloading cuts for one visiting order. The cart is emptied at
+        # the end point (분리수거장, or the office) whenever the next bins would not fit; dynamic
+        # programming picks where to break the order into trips.
+        key = tuple(route)
+        if key in cache:
+            return cache[key]
+        n = len(route)
+        chain_t, chain_m = [0.0], [0.0]
+        for a, b in zip(route, route[1:]):
+            chain_t.append(chain_t[-1] + seconds[a][b])
+            chain_m.append(chain_m[-1] + metres[a][b])
+        best = [(0.0, 0.0, -1)] + [(math.inf, 0.0, -1)] * n
+        for j in range(1, n + 1):
+            carried = 0.0
+            for i in range(j - 1, -1, -1):
+                carried += load[route[i]]
+                if carried > capacity + 1e-9 and i < j - 1:
+                    break
+                start = "OFFICE" if i == 0 else end
+                trip_t = seconds[start][route[i]] + chain_t[j - 1] - chain_t[i] + seconds[route[j - 1]][end]
+                trip_m = metres[start][route[i]] + chain_m[j - 1] - chain_m[i] + metres[route[j - 1]][end]
+                value = best[i][0] + trip_t + service * (j - i) + unload
+                if value < best[j][0]:
+                    best[j] = (value, best[i][1] + trip_m, i)
+        cuts, j = [], n
+        while j > 0:
+            cuts.append(j)
+            j = best[j][2]
+        cache[key] = result = (best[n][0], best[n][1], sorted(cuts))
+        return result
 
-    def elapsed(route):
-        return length(route) / speed + service * len(route)
+    def value_of(span, total, used, preset):
+        # fastest: finish time, then total time; the cap needs no term, because the earliest finish
+        # keeps everyone under it whenever that is possible. lean: the worst overrun of the cap first,
+        # then the number of workers, then total time.
+        if preset == "fastest":
+            return span + 0.001 * total
+        return 1e7 * max(0.0, span - limit) + 1e5 * used + total
 
-    # Farthest-first insertion balances projected finishing time, including the return to the office.
-    for target in sorted(targets, key=lambda t: (-distances["OFFICE"][t], t)) if workers else []:
-        options = []
-        for worker, route in enumerate(assignments):
-            for position in range(len(route) + 1):
-                candidate = route[:position] + [target] + route[position:]
-                times = [elapsed(candidate) if i == worker else elapsed(r) for i, r in enumerate(assignments)]
-                options.append((max(times), sum(times), worker, position))
-        _, _, worker, position = min(options)
-        assignments[worker].insert(position, target)
+    def score(routes, preset):
+        times = [evaluate(r)[0] for r in routes if r]
+        return value_of(max(times, default=0.0), sum(times), len(times), preset)
 
-    # Route reversal (2-opt), followed by bounded cross-worker relocation.
-    def improve(route):
-        for _ in range(12):
-            best, best_length = route, length(route)
+    def options(routes, target, preset):
+        # Every place the target could go, cheapest first. Only the first empty route is tried.
+        times = [evaluate(r)[0] for r in routes]
+        total, used = sum(times), sum(1 for r in routes if r)
+        found, tried_empty = [], False
+        for r, route in enumerate(routes):
+            if not route:
+                if tried_empty:
+                    continue
+                tried_empty = True
+            other_span = max(times[:r] + times[r + 1:], default=0.0)
+            for p in range(len(route) + 1):
+                new = evaluate(route[:p] + [target] + route[p:])[0]
+                value = value_of(max(other_span, new), total - times[r] + new, used + (0 if route else 1), preset)
+                found.append((value, r, p))
+        found.sort()
+        return found
+
+    def repair(routes, removed, preset, regret):
+        # Greedy: put each stop in its cheapest place. Regret-2: first place the stop that would lose
+        # the most if its best place were taken.
+        routes, left = [r[:] for r in routes], list(removed)
+        while left:
+            if regret:
+                choice = None
+                for t in left:
+                    found = options(routes, t, preset)
+                    gap = found[1][0] - found[0][0] if len(found) > 1 else math.inf
+                    if choice is None or gap > choice[0]:
+                        choice = (gap, t, found[0])
+                _, t, (_, r, p) = choice
+            else:
+                t = left[0]
+                _, r, p = options(routes, t, preset)[0]
+            routes[r].insert(p, t)
+            left.remove(t)
+        return routes
+
+    def destroy(routes, how, rng):
+        stops = [t for r in routes for t in r]
+        count = min(len(stops), rng.randint(1, max(1, min(5, len(stops) // 3 + 1))))
+        if how == "random":
+            removed = rng.sample(stops, count)
+        elif how == "worst":
+            savings = sorted(((evaluate(r)[0] - evaluate(r[:i] + r[i + 1:])[0], t) for r in routes for i, t in enumerate(r)), reverse=True)
+            removed = [t for _, t in savings[:count]]
+        elif how == "related":
+            seed = rng.choice(stops)
+            removed = sorted(stops, key=lambda t: (seconds[seed][t] + seconds[t][seed], t))[:count]
+        else:
+            removed = list(rng.choice([r for r in routes if r]))
+        gone = set(removed)
+        return [[t for t in r if t not in gone] for r in routes], removed
+
+    def polish(route):
+        # Reverse a section (2-opt) or move one stop, judged by the full route time with unloading.
+        for _ in range(20):
+            best, best_time = route, evaluate(route)[0]
             for i in range(len(route)):
                 for j in range(i + 2, len(route) + 1):
-                    candidate = route[:i] + list(reversed(route[i:j])) + route[j:]
-                    candidate_length = length(candidate)
-                    if candidate_length + 0.001 < best_length:
-                        best, best_length = candidate, candidate_length
+                    trial = route[:i] + list(reversed(route[i:j])) + route[j:]
+                    if evaluate(trial)[0] + 0.001 < best_time:
+                        best, best_time = trial, evaluate(trial)[0]
+                rest = route[:i] + route[i + 1:]
+                for p in range(len(rest) + 1):
+                    trial = rest[:p] + [route[i]] + rest[p:]
+                    if evaluate(trial)[0] + 0.001 < best_time:
+                        best, best_time = trial, evaluate(trial)[0]
             if best is route:
-                break
+                return route
             route = best
         return route
 
-    assignments = [improve(r) for r in assignments]
-    for _ in range(10):
-        old_score = (max((elapsed(r) for r in assignments), default=0), sum(elapsed(r) for r in assignments))
-        best_score, best_assignment = old_score, None
-        for i, route in enumerate(assignments):
-            if len(route) < 2:
-                continue
-            for target in route:
-                for j, other in enumerate(assignments):
-                    if i == j:
-                        continue
-                    for position in range(len(other) + 1):
-                        candidate = [r[:] for r in assignments]
-                        candidate[i].remove(target)
-                        candidate[j].insert(position, target)
-                        score = (max(elapsed(r) for r in candidate), sum(elapsed(r) for r in candidate))
-                        if score < best_score:
-                            best_score, best_assignment = score, candidate
-        if best_assignment is None:
-            break
-        assignments = [improve(r) for r in best_assignment]
+    def search(preset):
+        # Several independent runs with different random seeds, as long as the time budget allows;
+        # the best plan wins. The first run always completes.
+        if not workers:
+            return []
+        began, best = time.perf_counter(), None
+        for attempt in range(SEARCH_RESTARTS):
+            if attempt and time.perf_counter() - began > SEARCH_SECONDS / 2:
+                break
+            found = settle(anneal(preset, random.Random(f"{seed}-{preset}-{attempt}"), began), preset, began)
+            if best is None or score(found, preset) < score(best, preset) - 1e-6:
+                best = found
+        return best
+
+    def anneal(preset, rng, began):
+        # Adaptive large neighbourhood search: repeatedly remove a few stops and put them back,
+        # accept by simulated annealing, and use more often the removal rules that pay off.
+        start_routes = repair([[] for _ in range(workers)], sorted(targets, key=lambda t: (-seconds["OFFICE"][t], t)), preset, False)
+        current = best = start_routes
+        current_score = best_score = score(best, preset)
+        times = [evaluate(r)[0] for r in best if r]
+        heat = max(0.5, SEARCH_HEAT * (max(times) if preset == "fastest" else sum(times)))
+        rules, weights = ["random", "worst", "related", "route"], [1.0] * 4
+        gained, used = [0.0] * 4, [0] * 4
+        rounds = SEARCH_ROUNDS + SEARCH_ROUNDS_PER_STOP * len(targets) if len(targets) > 1 else 0
+        for step in range(rounds):
+            if time.perf_counter() - began > SEARCH_SECONDS:
+                break
+            k = rng.choices(range(4), weights)[0]
+            partial, removed = destroy(current, rules[k], rng)
+            candidate = repair(partial, removed, preset, regret=len(targets) <= 15 and rng.random() < 0.3)
+            value = score(candidate, preset)
+            temperature = heat * 0.001 ** (step / rounds)
+            used[k] += 1
+            if value < best_score - 1e-6:
+                best, best_score, current, current_score = candidate, value, candidate, value
+                gained[k] += 3
+            elif value < current_score - 1e-6:
+                current, current_score = candidate, value
+                gained[k] += 2
+            elif value - current_score < 30 * temperature and rng.random() < math.exp(-(value - current_score) / temperature):
+                current, current_score = candidate, value
+                gained[k] += 1
+            if (step + 1) % 50 == 0:
+                weights = [max(0.1, 0.7 * w + 0.3 * (g / u if u else 0)) for w, g, u in zip(weights, gained, used)]
+                gained, used = [0.0] * 4, [0] * 4
+        return best
+
+    def settle(routes, preset, began):
+        # Finish with plain local search between workers: move one stop to another worker or swap two
+        # stops, taking the first change that helps, until none does or the time budget runs out.
+        routes = [polish(r) for r in routes]
+        improved = True
+        while improved and time.perf_counter() - began < SEARCH_SECONDS * 1.5:
+            improved = False
+            current = score(routes, preset)
+            times = [evaluate(r)[0] for r in routes]
+            for i, a in enumerate(routes):
+                for x, stop in enumerate(a):
+                    rest = a[:x] + a[x + 1:]
+                    for j, b in enumerate(routes):
+                        if i == j or (not b and any(not r for r in routes[:j])):
+                            continue
+                        others = [t for k, t in enumerate(times) if k not in (i, j)]
+                        trials = [(rest, b[:p] + [stop] + b[p:]) for p in range(len(b) + 1)]
+                        if i < j:
+                            trials += [(rest[:x] + [y] + rest[x:], b[:q] + [stop] + b[q + 1:]) for q, y in enumerate(b)]
+                        for new_a, new_b in trials:
+                            ta, tb = evaluate(new_a)[0], evaluate(new_b)[0]
+                            moved = [t for t in (ta, tb) if t] + [t for t in others if t]
+                            if value_of(max(moved, default=0.0), sum(moved), len(moved), preset) < current - 1e-6:
+                                routes[i], routes[j] = polish(new_a), polish(new_b)
+                                improved = True
+                                break
+                        if improved:
+                            break
+                    if improved:
+                        break
+                if improved:
+                    break
+        return routes
 
     def path(a, b):
-        route = [b]
-        while route[-1] != a:
-            route.append(predecessors[a][route[-1]])
-        return list(reversed(route))
+        steps = [b]
+        while steps[-1] != a:
+            steps.append(previous[a][steps[-1]])
+        out: list[str] = []
+        for step in reversed(steps):
+            step = step.removesuffix(CAR)
+            if not out or out[-1] != step:
+                out.append(step)
+        return out
 
+    def summary(assigned):
+        used = [r for r in assigned if r]
+        times = [evaluate(r)[0] for r in used]
+        return {"workers": len(used), "total_distance_m": round(sum(round(evaluate(r)[1], 1) for r in used), 1),
+                "makespan_seconds": max((round(t) for t in times), default=0), "total_seconds": round(sum(times))}
+
+    found = [search(preset) for preset in ("fastest", "lean")]
+    # Both searches run anyway, so each preset keeps whichever result is better by its own measure.
+    plans = {preset: min(found, key=lambda routes: score(routes, preset)) for preset in ("fastest", "lean")}
+    if mode not in plans:
+        mode = ROUTE_DEFAULTS["route_mode"]
     routes = []
-    for index, route in enumerate(assignments):
-        if not route:
-            continue
-        sequence = ["OFFICE"] + route + ["OFFICE"]
-        path_ids: list[str] = []
-        for a, b in zip(sequence, sequence[1:]):
+    for route in (r for r in plans[mode] if r):
+        duration, walked, cuts = evaluate(route)
+        sequence, previous_cut = [], 0
+        for cut in cuts:
+            sequence += route[previous_cut:cut] + [end]
+            previous_cut = cut
+        stops, path_ids = ["OFFICE"] + sequence, []
+        for a, b in zip(stops, stops[1:]):
             leg = path(a, b)
             path_ids.extend(leg if not path_ids else leg[1:])
+        index = len(routes)
         routes.append({"worker": index + 1, "color": ROUTE_COLORS[index % len(ROUTE_COLORS)],
-                       "bin_ids": route, "distance_m": round(length(route), 1),
-                       "duration_seconds": round(elapsed(route)),
+                       "bin_ids": route, "sequence": sequence, "drops": len(cuts),
+                       "distance_m": round(walked, 1), "duration_seconds": round(duration),
+                       "over_limit": duration > limit + 0.5,
                        "path": [{"id": n, "floor": nodes[n]["floor"], "x": nodes[n]["x"], "y": nodes[n]["y"],
                                  "kind": nodes[n].get("kind", "bin")} for n in path_ids]})
     return {"created_at": now(), "signature": route_signature(state), "include_orange": config["include_orange"],
-            "available_staff": config["available_staff"], "routes": routes,
+            "available_staff": config["available_staff"], "mode": mode, "end": end,
+            "max_work_seconds": None if limit == math.inf else limit, "routes": routes,
             "target_ids": targets, "unreachable": unreachable,
             "unassigned": targets if workers == 0 else [],
             "total_distance_m": round(sum(r["distance_m"] for r in routes), 1),
             "makespan_seconds": max((r["duration_seconds"] for r in routes), default=0),
-            "method": "dijkstra-balanced-insertion-2opt", "outdated": False}
+            "total_seconds": sum(r["duration_seconds"] for r in routes),
+            "comparison": {name: summary(assigned) for name, assigned in plans.items()},
+            "method": "time-model-alns", "outdated": False}
 
 
 class PlanRequest(StrictModel):
     available_staff: Optional[int] = Field(default=None, ge=0, le=12)
     include_orange: Optional[bool] = None
+    route_mode: Optional[RouteMode] = None
 
 
 @app.post("/api/plan")
@@ -710,11 +1032,16 @@ def real_simulation(body: Simulation, user=Depends(current_user)):
         return result_for(db, user, state)
 
 
+class DemoReset(StrictModel):
+    template: Literal["basic", "large"] = "basic"
+
+
 @app.post("/api/demo/reset")
-def reset_demo(user=Depends(current_user)):
+def reset_demo(body: DemoReset, user=Depends(current_user)):
     with LOCK, database() as db:
         old_state = read_workspace(db, user["id"])
-        state = new_workspace()
+        state = large_workspace() if body.template == "large" else new_workspace()
+        state["map_images"] = sample_floorplans(body.template)
         state["device_key_hint"] = old_state.get("device_key_hint")
         return result_for(db, user, state)
 
@@ -856,7 +1183,7 @@ def restore(body: RestoreRequest, user=Depends(current_user)):
         raise HTTPException(422, "백업 파일은 35MB 이하로 선택해 주세요.")
     try:
         incoming = body.workspace
-        config = ConfigPatch(**incoming["building"]).model_dump()
+        config = ConfigPatch(**(ROUTE_DEFAULTS | incoming["building"])).model_dump()
         if any(v is None for v in config.values()):
             raise ValueError("incomplete configuration")
         graph = Graph(**incoming["graph"]).model_dump(by_alias=True)

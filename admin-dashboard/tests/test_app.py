@@ -1,4 +1,5 @@
 import copy
+import itertools
 import json
 from datetime import datetime, timedelta, timezone
 
@@ -53,8 +54,8 @@ def test_warning_option_changes_targets_and_assigns_each_exactly_once(client):
     assigned = [id for r in both["routes"] for id in r["bin_ids"]]
     assert len(assigned) == len(set(assigned)) == 6
     assert set(assigned) == set(both["target_ids"])
-    assert len(both["routes"]) == 3
-    assert all(r["path"][0]["id"] == r["path"][-1]["id"] == "OFFICE" for r in both["routes"])
+    assert len(both["routes"]) == 3 and both["end"] == "DEPOT"
+    assert all(r["path"][0]["id"] == "OFFICE" and r["path"][-1]["id"] == "DEPOT" for r in both["routes"])
 
 
 def test_multi_floor_paths_follow_only_connected_edges(client):
@@ -80,6 +81,157 @@ def test_more_workers_reduce_finish_time_for_same_demo_targets(client):
     three = client.post("/api/plan", json={"include_orange": True, "available_staff": 3}).json()["last_plan"]
     assert one["target_ids"] == three["target_ids"]
     assert three["makespan_seconds"] < one["makespan_seconds"]
+
+
+def test_travel_times_price_stairs_by_direction_and_the_lift_wait_once(client):
+    state = client.post("/api/demo/reset", json={"template": "large"}).json()
+    b = state["building"]
+    nodes, arcs = backend.travel_graph(state)
+    assert backend.fastest_paths(arcs, "F1-WS")[0]["F3-WS"] == pytest.approx(2 * b["stairs_up_seconds"])
+    assert backend.fastest_paths(arcs, "F3-WS")[0]["F1-WS"] == pytest.approx(2 * b["stairs_down_seconds"])
+    ride = backend.fastest_paths(arcs, "F1-EL")[0]["F5-EL"]
+    assert ride == pytest.approx(b["elevator_wait_seconds"] + 4 * b["elevator_floor_seconds"])
+    # walking past the lift door (north corridor -> lift hall -> south corridor) costs walking only
+    walk = backend.fastest_paths(arcs, "F1-N2")[0]["F1-S2"]
+    assert walk == pytest.approx(40 * b["meters_per_unit"] / b["speed_mps"])
+    # with a cart the stairs are closed: going up two floors means the lift
+    client.patch("/api/config", json={"use_cart": True})
+    nodes, arcs = backend.travel_graph(workspace(client))
+    assert backend.fastest_paths(arcs, "F1-WS")[0]["F3-WS"] > 2 * b["elevator_wait_seconds"] / 2
+    plan = client.post("/api/plan", json={"include_orange": True}).json()["last_plan"]
+    assert not plan["unreachable"]
+    assert all(p["kind"] != "stairs" or q["floor"] == p["floor"] for r in plan["routes"] for p, q in zip(r["path"], r["path"][1:]))
+
+
+def test_cart_without_a_lift_cannot_reach_upper_floors(client):
+    client.patch("/api/config", json={"use_cart": True})
+    plan = client.post("/api/plan", json={}).json()["last_plan"]
+    assert set(plan["unreachable"]) == {"B-005", "B-010"}
+    assert [id for r in plan["routes"] for id in r["bin_ids"]] == ["B-002"]
+
+
+def test_cart_capacity_adds_unloading_trips(client):
+    one = client.post("/api/plan", json={"include_orange": True, "available_staff": 1}).json()["last_plan"]
+    client.patch("/api/config", json={"cart_capacity": 1})
+    tight = client.post("/api/plan", json={}).json()["last_plan"]
+    route = tight["routes"][0]
+    assert route["drops"] == len(route["bin_ids"]) == 6
+    assert route["sequence"] == [x for id in route["bin_ids"] for x in (id, "DEPOT")]
+    assert tight["makespan_seconds"] > one["makespan_seconds"]
+    client.patch("/api/config", json={"cart_capacity": 0})
+    free = client.post("/api/plan", json={}).json()["last_plan"]
+    assert free["routes"][0]["drops"] == 1
+    assert client.patch("/api/config", json={"cart_capacity": 0.5}).status_code == 422
+    assert client.patch("/api/config", json={"depot_node": "NOPE"}).status_code == 422
+
+
+def brute_force(state, targets, workers):
+    """Both presets by exhaustive search: every split of the targets between workers, every visiting
+    order and every choice of unloading stops, from the server's travel times."""
+    b = state["building"]
+    nodes, arcs = backend.travel_graph(state)
+    end = "DEPOT" if "DEPOT" in nodes else "OFFICE"
+    times = {s: backend.fastest_paths(arcs, s)[0] for s in ["OFFICE", end] + targets}
+    load = {x["id"]: x["fill"] / 100 for x in state["bins"] if x["id"] in targets}
+    capacity = b["cart_capacity"] or float("inf")
+
+    def trip(start, stops):
+        legs = [start] + list(stops) + [end]
+        return sum(times[x][y] for x, y in zip(legs, legs[1:])) + b["service_seconds"] * len(stops) + b["unload_seconds"]
+
+    best_route = {}
+    for size in range(1, len(targets) + 1):
+        for group in itertools.combinations(targets, size):
+            options = []
+            for order in itertools.permutations(group):
+                for cuts in itertools.product([False, True], repeat=size - 1):
+                    trips, current = [], [order[0]]
+                    for stop, cut in zip(order[1:], cuts):
+                        if cut:
+                            trips.append(current)
+                            current = []
+                        current.append(stop)
+                    trips.append(current)
+                    if all(sum(load[t] for t in t_) <= capacity + 1e-9 for t_ in trips):
+                        options.append(sum(trip("OFFICE" if i == 0 else end, t_) for i, t_ in enumerate(trips)))
+            best_route[frozenset(group)] = min(options)
+    limit = b["max_work_minutes"] * 60 or float("inf")
+    fastest = lean = None
+    for owner in itertools.product(range(workers), repeat=len(targets)):
+        groups = [frozenset(t for t, o in zip(targets, owner) if o == w) for w in range(workers)]
+        spans = [best_route[g] for g in groups if g]
+        fast_value = (round(max(spans), 6), round(sum(spans), 6))
+        lean_value = (round(max(0.0, max(spans) - limit), 6), len(spans), round(sum(spans), 6))
+        fastest = fast_value if fastest is None or fast_value < fastest else fastest
+        lean = lean_value if lean is None or lean_value < lean else lean
+    return fastest, lean
+
+
+def test_presets_match_exhaustive_search(client):
+    state = client.post("/api/plan", json={"include_orange": True, "available_staff": 3, "route_mode": "fastest"}).json()
+    fast = state["last_plan"]
+    assert state["building"]["route_mode"] == fast["mode"] == "fastest"
+    (span, total), (overrun, used, lean_total) = brute_force(state, fast["target_ids"], 3)
+    assert fast["makespan_seconds"] == round(span)
+    assert fast["total_seconds"] == pytest.approx(total, abs=len(fast["routes"]))
+    lean = client.post("/api/plan", json={"route_mode": "lean"}).json()["last_plan"]
+    assert lean["mode"] == "lean" and overrun == 0
+    assert len(lean["routes"]) == used and lean["total_seconds"] == pytest.approx(lean_total, abs=used)
+    assert all(not r["over_limit"] and r["duration_seconds"] <= 20 * 60 for r in lean["routes"])
+    assert fast["comparison"] == lean["comparison"]
+    assert fast["makespan_seconds"] <= lean["makespan_seconds"] and len(lean["routes"]) <= len(fast["routes"])
+    for plan in (fast, lean):
+        assigned = [id for r in plan["routes"] for id in r["bin_ids"]]
+        assert sorted(assigned) == sorted(plan["target_ids"])
+
+
+def test_many_stops_and_input_validation(client):
+    client.post("/api/demo/reset", json={"template": "large"})
+    client.post("/api/demo/scenario", json={"scenario": "rush"})
+    plan = client.post("/api/plan", json={"include_orange": True, "available_staff": 5, "route_mode": "fastest"}).json()["last_plan"]
+    assert len(plan["target_ids"]) == 29
+    fast, lean = plan["comparison"]["fastest"], plan["comparison"]["lean"]
+    assert fast["makespan_seconds"] <= lean["makespan_seconds"] and lean["workers"] <= fast["workers"]
+    assigned = [id for r in plan["routes"] for id in r["bin_ids"]]
+    assert sorted(assigned) == sorted(plan["target_ids"])
+    assert client.post("/api/plan", json={"route_mode": "balanced"}).status_code == 422
+    # workspaces saved with retired route modes read back with the default preset
+    with backend.database() as db:
+        user_id = db.execute("SELECT id FROM users WHERE email=?", (backend.DEMO_EMAIL,)).fetchone()[0]
+        state = backend.read_workspace(db, user_id)
+        state["building"].update(route_mode="shortest", route_slack_percent=10)
+        del state["building"]["stairs_up_seconds"]
+        backend.save_workspace(db, user_id, state)
+    building = workspace(client)["building"]
+    assert building["route_mode"] == "fastest" and "route_slack_percent" not in building
+    assert building["stairs_up_seconds"] == backend.ROUTE_DEFAULTS["stairs_up_seconds"]
+    assert client.post("/api/restore", json=client.get("/api/backup").json()).status_code == 200
+
+
+def test_large_sample_building_has_floor_plans_several_cores_and_both_presets(client):
+    state = client.post("/api/demo/reset", json={"template": "large"}).json()
+    assert state["building"]["floors"] == 5 and len(state["bins"]) == 30
+    assert sum(b["device_type"] == "real" for b in state["bins"]) == 1
+    backend.validate_graph(state["graph"], 5)
+    for b in state["bins"]:
+        backend.validate_bin(state, b)
+    assert sorted(state["map_images"]) == ["1", "2", "3", "4", "5"]
+    assert client.get("/api/floorplan/3").status_code == 200
+    fast = client.post("/api/plan", json={"include_orange": True, "route_mode": "fastest"}).json()["last_plan"]
+    lean = client.post("/api/plan", json={"route_mode": "lean"}).json()["last_plan"]
+    assert not fast["unreachable"] and len(fast["target_ids"]) == 13 and fast["end"] == "DEPOT"
+    assert 1 <= len(lean["routes"]) <= len(fast["routes"]) <= 3
+    cores = {p["id"].split("-")[1] for r in fast["routes"] + lean["routes"] for p in r["path"]
+             if p["kind"] in ("stairs", "elevator")}
+    assert len(cores) >= 2
+    graph = workspace(client)["graph"]
+    graph["nodes"] = [n for n in graph["nodes"] if n["id"] != "F1-S4"]
+    graph["edges"] = [e for e in graph["edges"] if "F1-S4" not in (e["from"], e["to"])]
+    assert client.put("/api/graph", json=graph).json()["building"]["depot_node"] == ""
+    saved = client.get("/api/backup").json()
+    assert len(saved["images"]) == 5
+    assert client.post("/api/restore", json=saved).status_code == 200
+    assert client.post("/api/demo/reset", json={}).json()["building"]["floors"] == 3
 
 
 def test_zero_staff_no_targets_and_unreachable_are_explicit(client):
@@ -159,6 +311,11 @@ def test_backup_restore_includes_logs_and_validates_before_mutation(client):
     assert result.status_code == 200
     assert result.json()["building"]["name"] == "백업 건물"
     assert result.json()["logs"][0]["bin_id"] == "B-002"
+    older = copy.deepcopy(saved)
+    for key in ("route_mode", "cart_capacity", "depot_node", "max_work_minutes"):
+        del older["workspace"]["building"][key]
+    restored = client.post("/api/restore", json=older).json()["building"]
+    assert restored["route_mode"] == "fastest" and restored["cart_capacity"] == 4 and restored["depot_node"] == ""
     invalid = copy.deepcopy(saved)
     invalid["workspace"]["building"]["critical_threshold"] = 10
     assert client.post("/api/restore", json=invalid).status_code == 422
