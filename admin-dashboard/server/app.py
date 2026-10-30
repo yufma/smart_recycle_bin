@@ -23,8 +23,13 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from .sample_layout import (LARGE_BINS, LARGE_CORES, LARGE_CORRIDOR_X, LARGE_CORRIDORS, LARGE_DEPOT, LARGE_FILLS,
-                            LARGE_FLOORS, LARGE_OFFICE, LARGE_ROOMS, large_room_label)
+from .sample_layout import (CIVIC_CORES, CIVIC_CORRIDOR, CIVIC_FILL_PATTERN, CIVIC_FLOORS, CIVIC_LINKS,
+                            CIVIC_POINTS, CIVIC_ROOM_NAMES, CIVIC_ROOMS, civic_bin_at, LARGE_BINS, ROUND_CENTRES, ROUND_CORES,
+                            ROUND_FILL_PATTERN, ROUND_FLOORS, ROUND_INNER_U, ROUND_M_PER_PX, ROUND_OUTER_U,
+                            ROUND_POINTS, ROUND_RADIALS, ROUND_RADII, ROUND_ROOM_NAMES, ROUND_ROOMS, round_at, round_bin_at,
+                            round_door, round_nearest, round_px, LARGE_CORES, LARGE_CORRIDOR_X, LARGE_CORRIDORS, LARGE_DEPOT, LARGE_FILLS,
+                            LARGE_FLOORS, LARGE_OFFICE, LARGE_ROOMS, LIBRARY_CORES, LIBRARY_FLOORS, LIBRARY_POINTS,
+                            LIBRARY_RING, LIBRARY_ROOM_NAMES, LIBRARY_ROOMS, large_room_label, library_fill)
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = Path(os.environ.get("RELOOP_DATA_DIR", str(ROOT / "data")))
@@ -51,6 +56,13 @@ Compartment = Literal["CAN", "PET", "GLASS", "OTHER"]
 Percent = Annotated[float, Field(ge=0, le=100, allow_inf_nan=False)]
 OLD_CATEGORY = {"PET": "PET", "캔": "CAN", "유리": "GLASS", "일반": "OTHER", "혼합": "OTHER"}
 CART_SPEED_RATIO = 0.85  # walking speed with a loaded cart
+# The map draws its 0-100 units on a 900 x 460 pixel plan, so a unit down is shorter than a unit across.
+# Distances are measured as drawn; meters_per_unit is the scale across.
+MAP_Y_SCALE = 460 / 900
+
+
+def map_distance(a: dict, b: dict, meters_per_unit: float) -> float:
+    return math.hypot(a["x"] - b["x"], (a["y"] - b["y"]) * MAP_Y_SCALE) * meters_per_unit
 CAR = "~car"  # suffix of the car twin of each lift node
 # Search effort per preset: up to SEARCH_RESTARTS runs of base rounds plus rounds per stop, within a
 # time budget in seconds.
@@ -210,14 +222,168 @@ def large_workspace() -> dict:
     return state
 
 
+def library_workspace() -> dict:
+    state = new_workspace()
+    nodes, edges, bins = [], [], []
+    stamp = state["updated_at"]
+    ring = [point for point, _, _ in LIBRARY_RING]
+    taken = {(floor, room) for floor, room, *_ in LIBRARY_POINTS}
+    for floor in range(1, LIBRARY_FLOORS + 1):
+        for index, (point, x, y) in enumerate(LIBRARY_RING):
+            side = {"N": "북쪽 복도", "S": "남쪽 복도", "W": "서쪽 복도", "E": "동쪽 복도"}[point[0]]
+            nodes.append({"id": f"F{floor}-{point}", "floor": floor, "x": x, "y": y, "kind": "corridor",
+                          "label": f"{side} {int(point[1:]) + 1}" if point[0] in "NS" else side})
+            after = ring[(index + 1) % len(ring)]
+            edges.append({"id": f"E{floor}-{point}-{after}", "from": f"F{floor}-{point}", "to": f"F{floor}-{after}", "distance_m": None})
+        for code, x, y, kind, label, door, rise in LIBRARY_CORES:
+            node_id = f"F{floor}-{code}"
+            nodes.append({"id": node_id, "floor": floor, "x": x, "y": y, "kind": kind, "label": label})
+            edges.append({"id": f"E-F{floor}-{door}-{node_id}", "from": f"F{floor}-{door}", "to": node_id, "distance_m": None})
+            if floor > 1:
+                edges.append({"id": f"V-F{floor-1}-{code}-{node_id}", "from": f"F{floor-1}-{code}", "to": node_id, "distance_m": rise})
+        for room, (_, door, (x, y)) in enumerate(LIBRARY_ROOMS):
+            if (floor, room) in taken:
+                continue
+            number = len(bins) + 1
+            bins.append({"id": f"B-{number:03}", "name": f"{LIBRARY_ROOM_NAMES[floor][room]} 앞",
+                         "floor": floor, "x": x, "y": y, "access_node": f"F{floor}-{door}",
+                         **sample_fills(None if number == 1 else library_fill(floor, room), number),
+                         "device_type": "real" if number == 1 else "demo",
+                         "reading_source": "unconnected" if number == 1 else "demo",
+                         "measured_at": None if number == 1 else stamp,
+                         "received_at": None if number == 1 else stamp, "awaiting_confirmation": False})
+    counts = {"office": 0, "depot": 0}
+    for floor, room, kind, (x, y), label in LIBRARY_POINTS:
+        counts[kind] += 1
+        node_id = f"F{floor}-{'OF' if kind == 'office' else 'DP'}{counts[kind]}"
+        door = f"F{floor}-{LIBRARY_ROOMS[room][1]}"
+        nodes.append({"id": node_id, "floor": floor, "x": x, "y": y, "kind": kind, "label": label})
+        edges.append({"id": f"E-{door}-{node_id}", "from": door, "to": node_id, "distance_m": None})
+    state["building"].update(name="예시 · 시립 중앙도서관", floors=LIBRARY_FLOORS, total_staff=6, available_staff=4,
+                             meters_per_unit=1.0)
+    state.update(bins=bins, graph={"nodes": nodes, "edges": edges})
+    return state
+
+
+def civic_workspace() -> dict:
+    state = new_workspace()
+    nodes, edges, bins = [], [], []
+    stamp = state["updated_at"]
+    taken = {(floor, room) for floor, room, *_ in CIVIC_POINTS}
+    for floor in range(1, CIVIC_FLOORS + 1):
+        here = {point for point, *_, top in CIVIC_CORRIDOR if floor <= top}
+        for point, x, y, label, top in CIVIC_CORRIDOR:
+            if point in here:
+                nodes.append({"id": f"F{floor}-{point}", "floor": floor, "x": x, "y": y, "kind": "corridor", "label": label})
+        for a, b in CIVIC_LINKS:
+            if a in here and b in here:
+                edges.append({"id": f"E{floor}-{a}-{b}", "from": f"F{floor}-{a}", "to": f"F{floor}-{b}", "distance_m": None})
+        for room, (rect, door, top, every_floor) in enumerate(CIVIC_ROOMS):
+            if floor > top or (floor, room) in taken or not (every_floor or floor == 1):
+                continue
+            number = len(bins) + 1
+            x, y = civic_bin_at(CIVIC_ROOMS[room])
+            bins.append({"id": f"B-{number:03}", "name": f"{CIVIC_ROOM_NAMES[floor][room]} 앞",
+                         "floor": floor, "x": x, "y": y, "access_node": f"F{floor}-{door}",
+                         **sample_fills(None if number == 1 else CIVIC_FILL_PATTERN[number % len(CIVIC_FILL_PATTERN)], number),
+                         "device_type": "real" if number == 1 else "demo",
+                         "reading_source": "unconnected" if number == 1 else "demo",
+                         "measured_at": None if number == 1 else stamp,
+                         "received_at": None if number == 1 else stamp, "awaiting_confirmation": False})
+    for code, x, y, kind, label, door, rise, top, closed in CIVIC_CORES:
+        # open stops are linked floor to floor; an out-of-service stop is skipped
+        below = None
+        for floor in range(1, top + 1):
+            node_id = f"F{floor}-{code}"
+            nodes.append({"id": node_id, "floor": floor, "x": x, "y": y, "kind": kind, "label": label, "closed": floor in closed})
+            edges.append({"id": f"E-F{floor}-{door}-{node_id}", "from": f"F{floor}-{door}", "to": node_id, "distance_m": None})
+            if floor in closed:
+                continue
+            if below:
+                edges.append({"id": f"V-{below}-{node_id}", "from": below, "to": node_id,
+                              "distance_m": rise * (floor - int(below[1:below.index('-')]))})
+            below = node_id
+    counts = {"office": 0, "depot": 0}
+    for floor, room, kind, (x, y), label in CIVIC_POINTS:
+        counts[kind] += 1
+        node_id = f"F{floor}-{'OF' if kind == 'office' else 'DP'}{counts[kind]}"
+        door = f"F{floor}-{CIVIC_ROOMS[room][1]}"
+        nodes.append({"id": node_id, "floor": floor, "x": x, "y": y, "kind": kind, "label": label})
+        edges.append({"id": f"E-{door}-{node_id}", "from": door, "to": node_id, "distance_m": None})
+    state["building"].update(name="예시 · 시민 복합청사", floors=CIVIC_FLOORS, total_staff=8, available_staff=5,
+                             meters_per_unit=1.2)
+    state.update(bins=bins, graph={"nodes": nodes, "edges": edges})
+    return state
+
+
+def round_workspace() -> dict:
+    state = new_workspace()
+    nodes, edges, bins = [], [], []
+    stamp = state["updated_at"]
+    taken = {(floor, room) for floor, room, *_ in ROUND_POINTS}
+    places = {}  # node id -> plan pixels, to measure the links on the curved geometry
+
+    def link(edge_id, a, b):
+        (ax, ay), (bx, by) = places[a], places[b]
+        edges.append({"id": edge_id, "from": a, "to": b, "distance_m": max(0.1, round(math.hypot(ax - bx, ay - by) * ROUND_M_PER_PX, 1))})
+
+    def point(node_id, floor, u, radius, kind, label):
+        x, y = round_at(u, radius)
+        places[node_id] = round_px(u, radius)
+        nodes.append({"id": node_id, "floor": floor, "x": x, "y": y, "kind": kind, "label": label})
+
+    for floor in range(1, ROUND_FLOORS + 1):
+        # the curved corridors: closely spaced points joined in a ring
+        for ring, spots, radius, name in (("OR", ROUND_OUTER_U, ROUND_RADII["outer_corridor"], "바깥 곡선 복도"),
+                                          ("IR", ROUND_INNER_U, ROUND_RADII["inner_corridor"], "안쪽 곡선 복도")):
+            for k, u in enumerate(spots):
+                point(f"F{floor}-{ring}{k}", floor, u, radius, "corridor", f"{name} {k + 1}")
+            for k in range(len(spots)):
+                link(f"E{floor}-{ring}{k}", f"F{floor}-{ring}{k}", f"F{floor}-{ring}{(k + 1) % len(spots)}")
+        for u in ROUND_RADIALS:
+            link(f"E{floor}-RAD{ROUND_OUTER_U.index(u)}", f"F{floor}-IR{ROUND_INNER_U.index(u)}", f"F{floor}-OR{ROUND_OUTER_U.index(u)}")
+        for code, u, radius, kind, label in ROUND_CORES:
+            node_id = f"F{floor}-{code}"
+            point(node_id, floor, u, radius, kind, label)
+            link(f"E-F{floor}-{code}", f"F{floor}-OR{round_nearest(ROUND_OUTER_U, u)}", node_id)
+            if floor > 1:
+                edges.append({"id": f"V-F{floor-1}-{code}-{node_id}", "from": f"F{floor-1}-{code}", "to": node_id,
+                              "distance_m": 15.0 if kind == "elevator" else 12.0})
+        for room, spec in enumerate(ROUND_ROOMS):
+            if (floor, room) in taken:
+                continue
+            number = len(bins) + 1
+            x, y = round_bin_at(spec)
+            bins.append({"id": f"B-{number:03}", "name": f"{ROUND_ROOM_NAMES[floor][room]} 앞",
+                         "floor": floor, "x": x, "y": y, "access_node": f"F{floor}-{round_door(spec)}",
+                         **sample_fills(None if number == 1 else ROUND_FILL_PATTERN[number % len(ROUND_FILL_PATTERN)], number),
+                         "device_type": "real" if number == 1 else "demo",
+                         "reading_source": "unconnected" if number == 1 else "demo",
+                         "measured_at": None if number == 1 else stamp,
+                         "received_at": None if number == 1 else stamp, "awaiting_confirmation": False})
+    counts = {"office": 0, "depot": 0}
+    for floor, room, kind, u, radius, label in ROUND_POINTS:
+        counts[kind] += 1
+        node_id = f"F{floor}-{'OF' if kind == 'office' else 'DP'}{counts[kind]}"
+        point(node_id, floor, u, radius, kind, label)
+        door = f"F{floor}-{round_door(ROUND_ROOMS[room])}"
+        link(f"E-{door}-{node_id}", door, node_id)
+    # one map unit is 9 plan pixels across; bins and new links are measured with it
+    state["building"].update(name="예시 · 시립 곡선형 컨벤션센터", floors=ROUND_FLOORS, total_staff=8, available_staff=5,
+                             meters_per_unit=round(9 * ROUND_M_PER_PX, 2))
+    state.update(bins=bins, graph={"nodes": nodes, "edges": edges})
+    return state
+
+
 def sample_floorplans(template: str) -> dict:
-    if template != "large":
+    floors = {"large": LARGE_FLOORS, "library": LIBRARY_FLOORS, "civic": CIVIC_FLOORS, "round": ROUND_FLOORS}.get(template)
+    if not floors:
         return {}
     images = {}
-    for floor in range(1, LARGE_FLOORS + 1):
-        source = SAMPLE_DIR / f"large-floor-{floor}.png"
+    for floor in range(1, floors + 1):
+        source = SAMPLE_DIR / f"{template}-floor-{floor}.png"
         if source.is_file():
-            name = f"sample-large-{floor}.png"
+            name = f"sample-{template}-{floor}.png"
             (MAP_DIR / name).write_bytes(source.read_bytes())
             images[str(floor)] = name
     return images
@@ -625,8 +791,8 @@ class GraphEdge(StrictModel):
 
 
 class Graph(StrictModel):
-    nodes: list[GraphNode] = Field(max_length=200)
-    edges: list[GraphEdge] = Field(max_length=600)
+    nodes: list[GraphNode] = Field(max_length=400)
+    edges: list[GraphEdge] = Field(max_length=1200)
 
 
 def validate_graph(graph: dict, floors: int):
@@ -675,7 +841,7 @@ def build_graph(state: dict):
         if edge.get("distance_m") is not None:
             distance = edge["distance_m"]
         elif a["floor"] == b["floor"]:
-            distance = math.hypot(a["x"] - b["x"], a["y"] - b["y"]) * config["meters_per_unit"]
+            distance = map_distance(a, b, config["meters_per_unit"])
         else:
             distance = abs(a["floor"] - b["floor"]) * 12.0
         connect(a["id"], b["id"], max(distance, 0.01))
@@ -684,7 +850,7 @@ def build_graph(state: dict):
         adjacency[point["id"]] = []
         access = nodes.get(point["access_node"])
         if access and access["floor"] == point["floor"]:
-            distance = math.hypot(point["x"] - access["x"], point["y"] - access["y"]) * config["meters_per_unit"]
+            distance = map_distance(point, access, config["meters_per_unit"])
             connect(point["id"], access["id"], max(distance, 0.01))
     return nodes, adjacency
 
@@ -793,8 +959,9 @@ def calculate_plan(state: dict) -> dict:
     # time at a location: a base time plus a time per compartment emptied
     serve = {t: config["service_seconds"] + config["compartment_seconds"] * len(v) for t, v in empty.items()}
     cache: dict[tuple, tuple] = {}
-    # Same inputs, same plan: the search is seeded from everything but the chosen preset.
-    seed = route_signature(dict(state, building={k: v for k, v in config.items() if k != "route_mode"}))
+    # Same inputs, same plan: the search is seeded from everything but the chosen preset and the
+    # number of available staff (the worker count of each search is part of its own seed).
+    seed = route_signature(dict(state, building={k: v for k, v in config.items() if k not in ("route_mode", "available_staff")}))
 
     def evaluate(route):
         # Seconds, walking metres, trips and start office for one visiting order. The route starts
@@ -854,11 +1021,10 @@ def calculate_plan(state: dict) -> dict:
     def value_of(span, total, used, preset):
         # fastest: finish time, then total time; the cap needs no term, because the earliest finish
         # keeps everyone under it whenever that is possible. lean: the worst overrun of the cap first,
-        # then the number of workers, then total time, then finish time (splits of the same total
-        # are common, and without it the one kept depended on the search's starting point).
+        # then the number of workers, then finish time, then total time.
         if preset == "fastest":
             return span + 0.001 * total
-        return 1e7 * max(0.0, span - limit) + 1e5 * used + total + 0.001 * span
+        return 1e7 * max(0.0, span - limit) + 1e5 * used + span + 0.001 * total
 
     def score(routes, preset):
         times = [evaluate(r)[0] for r in routes if r]
@@ -937,28 +1103,28 @@ def calculate_plan(state: dict) -> dict:
             route = best
         return route
 
-    def search(preset):
+    def search(preset, count):
         # Several independent runs with different random seeds, as long as the time budget allows;
-        # the best plan wins. The first run always completes.
-        if not workers:
+        # the best plan for at most `count` workers wins. The first run always completes.
+        if not count:
             return []
         began, best = time.perf_counter(), None
         for attempt in range(SEARCH_RESTARTS):
             if attempt and time.perf_counter() - began > SEARCH_SECONDS / 2:
                 break
-            found = settle(anneal(preset, random.Random(f"{seed}-{preset}-{attempt}"), began), preset, began)
+            found = settle(anneal(preset, count, random.Random(f"{seed}-{preset}-{count}-{attempt}"), began), preset, began)
             if best is None or score(found, preset) < score(best, preset) - 1e-6:
                 best = found
         return best
 
-    def anneal(preset, rng, began):
+    def anneal(preset, count, rng, began):
         # Adaptive large neighbourhood search: repeatedly remove a few stops and put them back,
         # accept by simulated annealing, and use more often the removal rules that pay off.
-        start_routes = repair([[] for _ in range(workers)], sorted(targets, key=lambda t: (-start_of(t)[0], t)), preset, False)
+        start_routes = repair([[] for _ in range(count)], sorted(targets, key=lambda t: (-start_of(t)[0], t)), preset, False)
         current = best = start_routes
         current_score = best_score = score(best, preset)
         times = [evaluate(r)[0] for r in best if r]
-        heat = max(0.5, SEARCH_HEAT * (max(times) if preset == "fastest" else sum(times)))
+        heat = max(0.5, SEARCH_HEAT * max(times))  # both presets now trade mainly in finish time
         rules, weights = ["random", "worst", "related", "route"], [1.0] * 4
         gained, used = [0.0] * 4, [0] * 4
         rounds = SEARCH_ROUNDS + SEARCH_ROUNDS_PER_STOP * len(targets) if len(targets) > 1 else 0
@@ -1037,9 +1203,17 @@ def calculate_plan(state: dict) -> dict:
         return {"workers": len(used), "total_distance_m": round(sum(round(evaluate(r)[1], 1) for r in used), 1),
                 "makespan_seconds": max((round(t) for t in times), default=0), "total_seconds": round(sum(times))}
 
-    found = [search(preset) for preset in ("fastest", "lean")]
-    # Both searches run anyway, so each preset keeps whichever result is better by its own measure.
-    plans = {preset: min(found, key=lambda routes: score(routes, preset)) for preset in ("fastest", "lean")}
+    fastest = search("fastest", workers)
+    # 인력 아끼기: first the fewest workers that keep everyone under the cap, then the fastest plan for
+    # exactly that many. The second search is the same as '빨리 끝내기' with that many staff, so spare
+    # staff never change the result.
+    fewest = search("lean", workers)
+    needed = sum(1 for r in fewest if r)
+    lean = fastest if needed == workers else search("fastest", needed)
+    if score(fewest, "lean") < score(lean, "lean") - 1e-6 and max((evaluate(r)[0] for r in lean if r), default=0.0) > limit:
+        lean = fewest  # the second search missed the cap that the first one kept
+    # '빨리 끝내기' never ends later than '인력 아끼기': it takes the lean plan if that one is faster.
+    plans = {"fastest": min((fastest, lean), key=lambda routes: score(routes, "fastest")), "lean": lean}
     if mode not in plans:
         mode = ROUTE_DEFAULTS["route_mode"]
     routes, split = [], []
@@ -1172,14 +1346,15 @@ def real_simulation(body: Simulation, user=Depends(current_user)):
 
 
 class DemoReset(StrictModel):
-    template: Literal["basic", "large"] = "basic"
+    template: Literal["basic", "large", "library", "civic", "round"] = "basic"
 
 
 @app.post("/api/demo/reset")
 def reset_demo(body: DemoReset, user=Depends(current_user)):
     with LOCK, database() as db:
         old_state = read_workspace(db, user["id"])
-        state = large_workspace() if body.template == "large" else new_workspace()
+        state = {"large": large_workspace, "library": library_workspace, "civic": civic_workspace,
+                 "round": round_workspace}.get(body.template, new_workspace)()
         state["map_images"] = sample_floorplans(body.template)
         state["device_key_hint"] = old_state.get("device_key_hint")
         return result_for(db, user, state)

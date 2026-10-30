@@ -1,6 +1,7 @@
 import copy
 import itertools
 import json
+import math
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -93,9 +94,10 @@ def test_travel_times_price_stairs_by_direction_and_the_lift_wait_once(client):
     assert backend.fastest_paths(arcs, "F3-WS")[0]["F1-WS"] == pytest.approx(2 * b["stairs_down_seconds"])
     ride = backend.fastest_paths(arcs, "F1-EL")[0]["F5-EL"]
     assert ride == pytest.approx(b["elevator_wait_seconds"] + 4 * b["elevator_floor_seconds"])
-    # walking past the lift door (north corridor -> lift hall -> south corridor) costs walking only
+    # walking past the lift door (north corridor -> lift hall -> south corridor) costs walking only;
+    # the 40 units are down the map, so they measure 460/900 of 40 units across
     walk = backend.fastest_paths(arcs, "F1-N2")[0]["F1-S2"]
-    assert walk == pytest.approx(40 * b["meters_per_unit"] / b["speed_mps"])
+    assert walk == pytest.approx(40 * backend.MAP_Y_SCALE * b["meters_per_unit"] / b["speed_mps"])
     # with a cart the stairs are closed: going up two floors means the lift
     client.patch("/api/config", json={"use_cart": True})
     nodes, arcs = backend.travel_graph(workspace(client))
@@ -171,7 +173,7 @@ def brute_force(state, targets, workers):
         groups = [frozenset(t for t, o in zip(targets, owner) if o == w) for w in range(workers)]
         spans = [best_route[g] for g in groups if g]
         fast_value = (round(max(spans), 6), round(sum(spans), 6))
-        lean_value = (round(max(0.0, max(spans) - limit), 6), len(spans), round(sum(spans), 6), round(max(spans), 6))
+        lean_value = (round(max(0.0, max(spans) - limit), 6), len(spans), round(max(spans), 6), round(sum(spans), 6))
         fastest = fast_value if fastest is None or fast_value < fastest else fastest
         lean = lean_value if lean is None or lean_value < lean else lean
     return fastest, lean
@@ -181,7 +183,7 @@ def test_presets_match_exhaustive_search(client):
     state = client.post("/api/plan", json={"include_orange": True, "available_staff": 3, "route_mode": "fastest"}).json()
     fast = state["last_plan"]
     assert state["building"]["route_mode"] == fast["mode"] == "fastest"
-    (span, total), (overrun, used, lean_total, lean_span) = brute_force(state, fast["target_ids"], 3)
+    (span, total), (overrun, used, lean_span, lean_total) = brute_force(state, fast["target_ids"], 3)
     assert fast["makespan_seconds"] == round(span)
     assert fast["total_seconds"] == pytest.approx(total, abs=len(fast["routes"]))
     lean = client.post("/api/plan", json={"route_mode": "lean"}).json()["last_plan"]
@@ -217,6 +219,78 @@ def test_many_stops_and_input_validation(client):
     assert building["route_mode"] == "fastest" and "route_slack_percent" not in building
     assert building["stairs_up_seconds"] == backend.ROUTE_DEFAULTS["stairs_up_seconds"]
     assert client.post("/api/restore", json=client.get("/api/backup").json()).status_code == 200
+
+
+def test_library_sample_has_a_corridor_ring_two_offices_and_floor_plans(client):
+    state = client.post("/api/demo/reset", json={"template": "library"}).json()
+    assert state["building"]["floors"] == 6 and len(state["bins"]) == 45
+    assert sum(b["device_type"] == "real" for b in state["bins"]) == 1
+    backend.validate_graph(state["graph"], 6)
+    for b in state["bins"]:
+        backend.validate_bin(state, b)
+    kinds = [(n["id"], n["kind"]) for n in state["graph"]["nodes"] if n["kind"] in ("office", "depot")]
+    assert kinds == [("F1-OF1", "office"), ("F4-OF2", "office"), ("F1-DP1", "depot")]
+    assert sorted(state["map_images"]) == ["1", "2", "3", "4", "5", "6"] and client.get("/api/floorplan/6").status_code == 200
+    plan = client.post("/api/plan", json={"include_orange": True}).json()["last_plan"]
+    assert not plan["unreachable"] and plan["issues"] == [] and plan["routes"]
+    # every floor is reached by stairs or a lift, and a 4F stop can start at the 4F office
+    floors = {p["floor"] for r in plan["routes"] for p in r["path"]}
+    assert len(floors) >= 5
+    assert client.post("/api/restore", json=client.get("/api/backup").json()).status_code == 200
+
+
+def test_civic_complex_has_two_wings_a_closed_lift_stop_and_two_drop_off_points(client):
+    state = client.post("/api/demo/reset", json={"template": "civic"}).json()
+    assert state["building"]["floors"] == 8 and len(state["bins"]) == 79
+    backend.validate_graph(state["graph"], 8)
+    for b in state["bins"]:
+        backend.validate_bin(state, b)
+    nodes = {n["id"]: n for n in state["graph"]["nodes"]}
+    assert "F6-BN0" not in nodes and "F5-BN0" in nodes  # the B wing ends at 5F
+    assert nodes["F3-EL2"]["closed"] and not nodes["F4-EL2"]["closed"]
+    lift = {e["id"] for e in state["graph"]["edges"] if e["id"].startswith("V-") and "EL2" in e["id"]}
+    assert lift == {"V-F1-EL2-F2-EL2", "V-F2-EL2-F4-EL2", "V-F4-EL2-F5-EL2"}
+    assert sorted(n["id"] for n in nodes.values() if n["kind"] in ("office", "depot")) == ["F1-DP1", "F1-DP2", "F1-OF1", "F6-OF2"]
+    assert sorted(state["map_images"]) == [str(f) for f in range(1, 9)]
+    # the graph is saved back through the API as it is
+    assert client.put("/api/graph", json=state["graph"]).status_code == 200
+    plan = client.post("/api/plan", json={"include_orange": True}).json()["last_plan"]
+    assert not plan["unreachable"] and plan["issues"] == [] and plan["routes"]
+    ends = {x for r in plan["routes"] for x in r["sequence"] if not x.startswith("B-")}
+    assert ends <= {"F1-DP1", "F1-DP2"}
+    # no route gets on or off the freight lift at 3F
+    assert all(p["id"] != "F3-EL2" for r in plan["routes"] for p in r["path"])
+
+
+def test_distances_follow_the_map_proportions(client):
+    # a unit down is drawn 460/900 as long as a unit across, and is measured that way
+    state = workspace(client)
+    _, adjacency = backend.build_graph(state)
+    across = dict(adjacency["F1-N1"])["F1-N2"]  # (20, 50) to (40, 50)
+    down = dict(adjacency["B-001"])["F1-N1"]  # (20, 29) to (20, 50)
+    assert across == pytest.approx(20 * 0.6) and down == pytest.approx(21 * 460 / 900 * 0.6)
+
+
+def test_curved_sample_keeps_round_corridors_round_on_screen(client):
+    state = client.post("/api/demo/reset", json={"template": "round"}).json()
+    assert state["building"]["floors"] == 4 and len(state["bins"]) == 61
+    backend.validate_graph(state["graph"], 4)
+    for b in state["bins"]:
+        backend.validate_bin(state, b)
+    # the outer corridor's east curve is a half circle in screen pixels (9 per unit across, 4.6 down)
+    nodes = {n["id"]: n for n in state["graph"]["nodes"]}
+    centre = backend.ROUND_CENTRES[1]
+    radii = [math.hypot(nodes[f"F1-OR{k}"]["x"] * 9 - centre[0], nodes[f"F1-OR{k}"]["y"] * 4.6 - centre[1]) for k in range(3, 10)]
+    assert max(radii) - min(radii) < 1 and abs(radii[0] - backend.ROUND_RADII["outer_corridor"]) < 1
+    # corridor links carry distances measured on that shape
+    ring = [e for e in state["graph"]["edges"] if e["id"].startswith("E1-OR")]
+    assert len(ring) == 18 and all(e["distance_m"] for e in ring)
+    # every bin stands by its door: the walk from its corridor point is short
+    _, adjacency = backend.build_graph(state)
+    assert all(dict(adjacency[b["id"]])[b["access_node"]] < 8 for b in state["bins"])
+    assert sorted(state["map_images"]) == ["1", "2", "3", "4"]
+    plan = client.post("/api/plan", json={"include_orange": True}).json()["last_plan"]
+    assert not plan["unreachable"] and plan["issues"] == [] and plan["routes"]
 
 
 def test_lean_result_does_not_depend_on_spare_staff(client):
