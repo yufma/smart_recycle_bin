@@ -1,8 +1,8 @@
 import { useEffect, useRef } from 'react';
 import type { CSSProperties, ReactNode } from 'react';
 import { Leaf, X, ArrowUpRight, Inbox } from 'lucide-react';
-import { statusText } from './types';
-import type { Status } from './types';
+import { compartmentName, compartments, dateTime, fillStatus, statusColor, statusText } from './types';
+import type { Bin, Building, Fills, Status } from './types';
 
 export function Logo({ light = false }: { light?: boolean }) {
   return <div className={`brand ${light ? 'light' : ''}`}><span className="brand-symbol"><Leaf size={25} strokeWidth={1.7} /></span><span>reloop<span className="brand-dot">.</span></span></div>;
@@ -10,6 +10,16 @@ export function Logo({ light = false }: { light?: boolean }) {
 export function Badge({ status }: { status: Status }) { return <span className={`status-badge ${status}`}><i />{statusText[status]}</span>; }
 export function BinArt({ fill, status = 'normal', large = false }: { fill: number | null; status?: Status; large?: boolean }) {
   return <div className={`bin-art ${status} ${large ? 'large' : ''}`} aria-hidden="true"><div className="bin-handle" /><div className="bin-lid" /><div className="bin-body"><div className="bin-fill" style={{ height: `${fill ?? 0}%` }} /><div className="bin-mark"><Leaf size={large ? 25 : 16} strokeWidth={1.5} /></div><div className="bin-groove left" /><div className="bin-groove right" /></div><i className="bin-wheel left" /><i className="bin-wheel right" /></div>;
+}
+export function CompartmentRow({ values, building, large = false }: { values: Fills; building: Building; large?: boolean }) {
+  return <div className={`compartment-row ${large ? 'large' : ''}`} role="group" aria-label="칸별 적재율">{compartments.map(c => {
+    const value = values[c];
+    return <div key={c}><span>{compartmentName[c]}</span><b className={value === null ? 'waiting-value' : ''}>{value === null ? '수신 대기' : `${Math.round(value)}%`}</b><i><em style={{ width: `${value ?? 0}%`, background: statusColor[fillStatus(value, building)] }} /></i></div>;
+  })}</div>;
+}
+export function SensorNotice({ bin, details = false }: { bin: Bin; details?: boolean }) {
+  if (bin.reading_source !== 'actual' || (!bin.partial_reading && !bin.stale_compartments?.length)) return null;
+  return <div className="sensor-notice" role="note"><span>{bin.partial_reading ? '일부 칸 수신 대기 · 최신 값만 반영' : '최신 칸 값 수신 대기'}</span>{details && !!bin.stale_compartments?.length && <p>이전 기록(계산에서 제외): {bin.stale_compartments.map(c => `${compartmentName[c]} ${bin.last_compartments?.[c] ?? '—'}% · ${dateTime(bin.compartment_measured_at?.[c] ?? null)}`).join(' / ')}</p>}</div>;
 }
 export function FloorTabs({ value, floors, onChange, all = false }: { value: number; floors: number; onChange: (n: number) => void; all?: boolean }) {
   return <div className="floor-tabs" role="group" aria-label="층 선택">{all && <button className={value === 0 ? 'active' : ''} onClick={() => onChange(0)}>전체 층</button>}{Array.from({ length: floors }, (_, i) => i + 1).map(f => <button key={f} className={value === f ? 'active' : ''} onClick={() => onChange(f)}>{f}F</button>)}</div>;

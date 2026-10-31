@@ -1,0 +1,29 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace = 'kr.reloop.admin'
+    compileSdk = 36
+
+    defaultConfig {
+        applicationId = 'kr.reloop.admin'
+        minSdk = 26
+        targetSdk = 36
+        versionCode = 1
+        versionName = '1.0'
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled = false
+            // for testing on our own phones; a store release needs its own key
+            signingConfig = signingConfigs.debug
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+}
