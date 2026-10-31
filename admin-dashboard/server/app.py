@@ -125,9 +125,24 @@ def sample_fills(level, index: int) -> dict:
     return set_fills({}, dict.fromkeys(COMPARTMENTS) if level is None else demo_fills(level, index))
 
 
-def to_empty(bin: dict, config: dict) -> dict:
+def current_fills(bin: dict, config: dict, at: datetime | None = None) -> dict:
+    """Operational values only. Keep raw readings in storage, but never refresh one compartment
+    with another's timestamp. Older single-timestamp workspaces use their original measurement time."""
+    values = dict.fromkeys(COMPARTMENTS) | (bin.get("compartments") or {})
+    if bin["reading_source"] != "actual":
+        return values
+    cutoff = (at or datetime.now(timezone.utc)) - timedelta(minutes=config["stale_minutes"])
+    times = bin.get("compartment_measured_at")
+    for compartment, value in values.items():
+        stamp = times.get(compartment) if times is not None else bin.get("measured_at")
+        if value is not None and (not stamp or parse_time(stamp) < cutoff):
+            values[compartment] = None
+    return values
+
+
+def to_empty(bin: dict, config: dict, at: datetime | None = None) -> dict:
     """Compartments emptied on a visit: every one at the warning level or above (all of them if none is)."""
-    known = {c: v for c, v in (bin.get("compartments") or {}).items() if v is not None}
+    known = {c: v for c, v in current_fills(bin, config, at).items() if v is not None}
     return {c: v for c, v in known.items() if v >= config["warning_threshold"]} or known
 
 
@@ -474,12 +489,14 @@ def upgrade_bins(state: dict) -> dict:
     """Bins saved with one category and one fill get four compartments: the old fill goes to its
     category's compartment and the others start empty (no value yet on a real device)."""
     for bin in state["bins"]:
-        if "compartments" in bin:
-            continue
-        category = OLD_CATEGORY.get(bin.pop("category", ""), "OTHER")
-        fills = dict.fromkeys(COMPARTMENTS, None if bin["device_type"] == "real" else 0.0)
-        fills[category] = bin.get("fill")
-        set_fills(bin, fills)
+        if "compartments" not in bin:
+            category = OLD_CATEGORY.get(bin.pop("category", ""), "OTHER")
+            fills = dict.fromkeys(COMPARTMENTS, None if bin["device_type"] == "real" else 0.0)
+            fills[category] = bin.get("fill")
+            set_fills(bin, fills)
+        if bin["reading_source"] == "actual" and "compartment_measured_at" not in bin:
+            bin["compartment_measured_at"] = {c: bin["measured_at"] for c, v in bin["compartments"].items()
+                                               if v is not None and bin.get("measured_at")}
     return state
 
 
@@ -521,35 +538,47 @@ def save_workspace(db, user_id: int, state: dict):
                (json.dumps(state, ensure_ascii=False, allow_nan=False), user_id))
 
 
-def bin_status(bin: dict, config: dict) -> str:
-    if bin["fill"] is None:
+def bin_status(bin: dict, config: dict, at: datetime | None = None) -> str:
+    fill = max((v for v in current_fills(bin, config, at).values() if v is not None), default=None)
+    if fill is None:
         return "offline"
     if bin.get("awaiting_confirmation"):
         return "pending"
-    if bin["reading_source"] == "actual":
-        measured = parse_time(bin["measured_at"])
-        if datetime.now(timezone.utc) - measured > timedelta(minutes=config["stale_minutes"]):
-            return "offline"
-    if bin["fill"] >= config["critical_threshold"]:
+    if fill >= config["critical_threshold"]:
         return "critical"
-    if bin["fill"] >= config["warning_threshold"]:
+    if fill >= config["warning_threshold"]:
         return "warning"
     return "normal"
 
 
-def route_signature(state: dict) -> str:
-    inputs = {"building": state["building"], "graph": state["graph"],
-              "bins": [{k: b.get(k) for k in ["id", "floor", "x", "y", "access_node", "compartments"]} |
-                       {"status": bin_status(b, state["building"])} for b in state["bins"]]}
+def route_signature(state: dict, at: datetime | None = None) -> str:
+    at = at or datetime.now(timezone.utc)
+    inputs = {"route_version": 2, "building": state["building"], "graph": state["graph"],
+              "bins": [{k: b.get(k) for k in ["id", "floor", "x", "y", "access_node"]} |
+                       {"compartments": current_fills(b, state["building"], at),
+                        "status": bin_status(b, state["building"], at)} for b in state["bins"]]}
     return hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest()
+
+
+def public_bin(bin: dict, config: dict, at: datetime | None = None) -> dict:
+    at = at or datetime.now(timezone.utc)
+    result = copy.deepcopy(bin)
+    values = current_fills(bin, config, at)
+    result.update(last_compartments=dict(bin["compartments"]), compartments=values,
+                  fill=max((v for v in values.values() if v is not None), default=None),
+                  stale_compartments=[c for c in COMPARTMENTS if bin["compartments"][c] is not None and values[c] is None],
+                  partial_reading=bin["reading_source"] == "actual" and any(v is not None for v in values.values())
+                                  and any(v is None for v in values.values()),
+                  status=bin_status(bin, config, at))
+    return result
 
 
 def public_workspace(state: dict, user: dict) -> dict:
     result = copy.deepcopy(state)
-    for bin in result["bins"]:
-        bin["status"] = bin_status(bin, result["building"])
+    at = datetime.now(timezone.utc)
+    result["bins"] = [public_bin(bin, state["building"], at) for bin in state["bins"]]
     if result.get("last_plan"):
-        result["last_plan"]["outdated"] = result["last_plan"]["signature"] != route_signature(state)
+        result["last_plan"]["outdated"] = result["last_plan"]["signature"] != route_signature(state, at)
     result["user"] = user
     return result
 
@@ -920,8 +949,9 @@ def fastest_paths(arcs: dict, start: str):
 
 def calculate_plan(state: dict) -> dict:
     config = state["building"]
-    selected = [b for b in state["bins"] if bin_status(b, config) == "critical" or
-                (config["include_orange"] and bin_status(b, config) == "warning")]
+    at = datetime.now(timezone.utc)
+    selected = [b for b in state["bins"] if bin_status(b, config, at) == "critical" or
+                (config["include_orange"] and bin_status(b, config, at) == "warning")]
     nodes, arcs = travel_graph(state)
     points = state["graph"]["nodes"]
     offices = [n["id"] for n in points if n["kind"] == "office"]
@@ -949,19 +979,34 @@ def calculate_plan(state: dict) -> dict:
         issues.append(f"관리자실에서 갈 수 없는 분리수거장이 있습니다: {', '.join(cut_off)}. '통로 연결' 도구로 이어 주세요.")
     if unreachable:
         issues.append(f"통로와 이어지지 않아 경로에서 빠진 쓰레기통이 있습니다: {', '.join(unreachable)}. 건물·배치도에서 통로 연결을 확인해 주세요.")
-    empty = {b["id"]: to_empty(b, config) for b in selected}
+    empty = {b["id"]: to_empty(b, config, at) for b in selected}
     load = {t: sum(v.values()) / 100 for t, v in empty.items()}  # in full compartments
     workers = min(config["available_staff"], len(targets))
     mode = config.get("route_mode", ROUTE_DEFAULTS["route_mode"])
     capacity = config["cart_capacity"] or math.inf
     limit = config["max_work_minutes"] * 60 or math.inf
     unload = config["unload_seconds"]
+    capacity_issues = [{"bin_id": t, "load": round(load[t], 3), "capacity": capacity}
+                       for t in targets if load[t] > capacity + 1e-9]
+    if capacity_issues:
+        # The MVP collects a location in one visit. Do not produce an impossible route or silently
+        # omit an oversized location. Leave the whole plan unassigned until the settings/data change.
+        issues += [f"{p['bin_id']}: 수거량 {p['load']:g}칸 분량 / 운반 가능 {p['capacity']:g}칸 분량. "
+                   "한 위치를 나눠 운반하는 기능은 아직 지원하지 않습니다. 실제 운반 용량과 수거 상태를 확인해 주세요."
+                   for p in capacity_issues]
+        return {"created_at": now(), "signature": route_signature(state, at), "include_orange": config["include_orange"],
+                "available_staff": config["available_staff"], "mode": mode, "end": "DEPOT" if depots else "OFFICE",
+                "issues": issues, "blocked_reason": "capacity", "capacity_issues": capacity_issues,
+                "max_work_seconds": None if limit == math.inf else limit, "routes": [], "target_ids": targets,
+                "unreachable": unreachable, "empty": {t: empty[t] for t in targets}, "unassigned": targets,
+                "total_distance_m": 0.0, "makespan_seconds": 0, "total_seconds": 0,
+                "method": "time-model-alns", "outdated": False}
     # time at a location: a base time plus a time per compartment emptied
     serve = {t: config["service_seconds"] + config["compartment_seconds"] * len(v) for t, v in empty.items()}
     cache: dict[tuple, tuple] = {}
     # Same inputs, same plan: the search is seeded from everything but the chosen preset and the
     # number of available staff (the worker count of each search is part of its own seed).
-    seed = route_signature(dict(state, building={k: v for k, v in config.items() if k not in ("route_mode", "available_staff")}))
+    seed = route_signature(dict(state, building={k: v for k, v in config.items() if k not in ("route_mode", "available_staff")}), at)
 
     def evaluate(route):
         # Seconds, walking metres, trips and start office for one visiting order. The route starts
@@ -988,7 +1033,7 @@ def calculate_plan(state: dict) -> dict:
             carried = 0.0
             for i in range(j - 1, -1, -1):
                 carried += load[route[i]]
-                if carried > capacity + 1e-9 and i < j - 1:
+                if carried > capacity + 1e-9:
                     break
                 inner_t = chain_t[j - 1] - chain_t[i] + served[j] - served[i] + unload
                 inner_m = chain_m[j - 1] - chain_m[i]
@@ -1242,7 +1287,7 @@ def calculate_plan(state: dict) -> dict:
                       "'통로 연결' 도구로 구역을 이어 주세요.")
         unreachable += split
         targets = [t for t in targets if t not in split]
-    return {"created_at": now(), "signature": route_signature(state), "include_orange": config["include_orange"],
+    return {"created_at": now(), "signature": route_signature(state, at), "include_orange": config["include_orange"],
             "available_staff": config["available_staff"], "mode": mode, "end": "DEPOT" if depots else "OFFICE", "issues": issues,
             "max_work_seconds": None if limit == math.inf else limit, "routes": routes,
             "target_ids": targets, "unreachable": unreachable, "empty": {t: empty[t] for t in targets},
@@ -1279,13 +1324,15 @@ def collect(bin_id: str, body: CollectRequest, user=Depends(current_user)):
     with LOCK, database() as db:
         state = read_workspace(db, user["id"])
         bin = find_bin(state, bin_id)
-        if bin["fill"] is None or bin.get("awaiting_confirmation"):
+        at = datetime.now(timezone.utc)
+        current = public_bin(bin, state["building"], at)
+        if current["fill"] is None or bin.get("awaiting_confirmation"):
             raise HTTPException(422, "수거할 상태값이 없거나 센서 확인을 기다리고 있습니다.")
-        if bin["reading_source"] == "actual" and bin_status(bin, state["building"]) == "offline":
+        if bin["reading_source"] == "actual" and current["status"] == "offline":
             raise HTTPException(422, "최신 센서값을 수신한 뒤 수거를 완료해 주세요.")
-        emptied = to_empty(bin, state["building"])
+        emptied = to_empty(bin, state["building"], at)
         state["logs"].insert(0, {"id": secrets.token_hex(6), "bin_id": bin_id, "floor": bin["floor"],
-                                 "name": bin["name"], "fill_before": bin["fill"], "emptied": emptied, "worker": body.worker,
+                                 "name": bin["name"], "fill_before": current["fill"], "emptied": emptied, "worker": body.worker,
                                  "actor": user["name"], "source": bin["reading_source"], "completed_at": now()})
         state["logs"] = state["logs"][:1000]
         if bin["reading_source"] == "actual":
@@ -1420,8 +1467,10 @@ def device_reading(body: DeviceReading, x_device_key: str = Header(default="", m
         state["readings"].insert(0, {"bin_id": bin["id"], "fill": bin["fill"], "fills": fills, "source": "actual", "at": now()})
         state["readings"] = state["readings"][:200]
         save_workspace(db, row["user_id"], state)
-    return {"ok": True, "bin_id": body.bin_id, "compartments": bin["compartments"], "fill_percent": bin["fill"],
-            "status": bin_status(bin, state["building"])}
+    current = public_bin(bin, state["building"])
+    return {"ok": True, "bin_id": body.bin_id, "compartments": current["compartments"], "fill_percent": current["fill"],
+            "stale_compartments": current["stale_compartments"], "partial_reading": current["partial_reading"],
+            "status": current["status"]}
 
 
 class MapImage(StrictModel):

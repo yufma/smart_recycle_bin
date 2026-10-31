@@ -1,8 +1,10 @@
 import copy
+import io
 import itertools
 import json
 import math
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse
 
 import pytest
 from fastapi.testclient import TestClient
@@ -115,12 +117,18 @@ def test_cart_without_a_lift_cannot_reach_upper_floors(client):
 
 
 def test_cart_capacity_adds_unloading_trips(client):
+    # Every single location fits; combining two locations exceeds this test's one-compartment limit.
+    for bin in workspace(client)["bins"]:
+        if bin["device_type"] == "demo":
+            fills = dict.fromkeys(backend.COMPARTMENTS, 0) | {"PET": bin["fill"]}
+            assert client.patch(f"/api/bins/{bin['id']}", json={"fills": fills}).status_code == 200
     one = client.post("/api/plan", json={"include_orange": True, "available_staff": 1}).json()["last_plan"]
     client.patch("/api/config", json={"cart_capacity": 1})
     tight = client.post("/api/plan", json={}).json()["last_plan"]
     route = tight["routes"][0]
     assert route["drops"] == len(route["bin_ids"]) == 6
     assert route["sequence"] == [x for id in route["bin_ids"] for x in (id, "F1-DP1")]
+    assert all(sum(tight["empty"][id].values()) / 100 <= 1 for id in route["bin_ids"])
     assert tight["makespan_seconds"] > one["makespan_seconds"]
     client.patch("/api/config", json={"cart_capacity": 0})
     free = client.post("/api/plan", json={}).json()["last_plan"]
@@ -549,3 +557,153 @@ def test_config_graph_validation_and_changed_inputs_mark_plan_outdated(client):
 
 def test_origin_protection(client):
     assert client.post("/api/plan", headers={"Origin": "https://untrusted.example"}, json={}).status_code == 403
+
+
+@pytest.mark.parametrize("compartment", backend.COMPARTMENTS)
+def test_sensor_sender_cli_reaches_the_compartment_api(client, monkeypatch, capsys, compartment):
+    from tools import send_reading
+
+    key = client.post("/api/device/key", json={}).json()["key"]
+    monkeypatch.setenv("RELOOP_DEVICE_KEY", key)
+
+    def request_to_test_api(request, timeout):
+        response = client.post(urlparse(request.full_url).path, headers=dict(request.header_items()),
+                               content=request.data)
+        assert response.status_code == 200, response.text
+        return io.BytesIO(response.content)
+
+    monkeypatch.setattr(send_reading.urllib.request, "urlopen", request_to_test_api)
+    assert send_reading.main(["--compartment", compartment.lower(), "--fill", "94"]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["compartments"][compartment] == 94 and result["status"] == "critical"
+    assert bin_by_id(workspace(client), "B-001")["compartments"][compartment] == 94
+
+
+@pytest.mark.parametrize("args", [["--fill", "94"], ["--compartment", "PAPER", "--fill", "94"],
+                                  ["--compartment", "PET", "--fill", "nan"],
+                                  ["--compartment", "PET", "--fill", "101"]])
+def test_sensor_sender_rejects_invalid_arguments_before_reading_credentials(monkeypatch, args):
+    from tools import send_reading
+
+    monkeypatch.delenv("RELOOP_DEVICE_KEY", raising=False)
+    monkeypatch.setattr(send_reading.getpass, "getpass", lambda *_: pytest.fail("Must validate before asking for a key"))
+    with pytest.raises(SystemExit) as error:
+        send_reading.main(args)
+    assert error.value.code == 2
+
+
+def test_new_measurement_does_not_refresh_other_stale_compartments(client):
+    client.post("/api/demo/scenario", json={"scenario": "calm"})
+    client.patch("/api/config", json={"cart_capacity": 1})
+    key = client.post("/api/device/key", json={}).json()["key"]
+    headers = {"X-Device-Key": key}
+    old = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+    client.post("/api/device/readings", headers=headers,
+                json={"bin_id": "B-001", "compartment": "PET", "fill_percent": 96, "measured_at": old})
+    response = client.post("/api/device/readings", headers=headers,
+                           json={"bin_id": "B-001", "compartment": "CAN", "fill_percent": 10}).json()
+    assert response["status"] == "normal" and response["fill_percent"] == 10
+    assert response["compartments"]["PET"] is None and response["stale_compartments"] == ["PET"]
+    assert response["partial_reading"] is True
+    assert "B-001" not in client.post("/api/plan", json={}).json()["last_plan"]["target_ids"]
+    view = bin_by_id(workspace(client), "B-001")
+    assert view["last_compartments"]["PET"] == 96 and view["fill"] == 10
+    saved = client.get("/api/backup").json()["workspace"]
+    assert bin_by_id(saved, "B-001")["compartments"]["PET"] == 96
+
+    # Only the fresh CAN value enters the route, load, collection log and confirmation requirements.
+    client.post("/api/device/readings", headers=headers,
+                json={"bin_id": "B-001", "compartment": "CAN", "fill_percent": 95})
+    plan = client.post("/api/plan", json={}).json()["last_plan"]
+    assert plan["empty"]["B-001"] == {"CAN": 95} and plan["routes"] and not plan.get("blocked_reason")
+    result = client.post("/api/collect/B-001", json={}).json()
+    assert result["logs"][0]["emptied"] == {"CAN": 95} and result["logs"][0]["fill_before"] == 95
+    assert bin_by_id(result, "B-001")["pending_compartments"] == ["CAN"]
+    client.post("/api/device/readings", headers=headers,
+                json={"bin_id": "B-001", "compartment": "CAN", "fill_percent": 0})
+    assert bin_by_id(workspace(client), "B-001")["status"] == "normal"
+
+
+def test_compartment_expiry_invalidates_plan_even_when_bin_stays_critical(client, monkeypatch):
+    moment = datetime.now(timezone.utc)
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return moment.astimezone(tz) if tz else moment.replace(tzinfo=None)
+
+    monkeypatch.setattr(backend, "datetime", Clock)
+    key = client.post("/api/device/key", json={}).json()["key"]
+    headers = {"X-Device-Key": key}
+    client.post("/api/device/readings", headers=headers,
+                json={"bin_id": "B-001", "fills": {"CAN": 95, "PET": 85, "GLASS": 10, "OTHER": 5}})
+    moment += timedelta(minutes=4)
+    client.post("/api/device/readings", headers=headers,
+                json={"bin_id": "B-001", "compartment": "CAN", "fill_percent": 95})
+    plan = client.post("/api/plan", json={}).json()["last_plan"]
+    assert plan["empty"]["B-001"] == {"CAN": 95, "PET": 85} and not plan["outdated"]
+
+    moment += timedelta(minutes=2)
+    state = workspace(client)
+    bin = bin_by_id(state, "B-001")
+    assert bin["status"] == "critical" and bin["fill"] == 95
+    assert bin["compartments"] == {"CAN": 95, "PET": None, "GLASS": None, "OTHER": None}
+    assert set(bin["stale_compartments"]) == {"PET", "GLASS", "OTHER"} and bin["partial_reading"]
+    assert state["last_plan"]["outdated"]
+    assert client.post("/api/plan", json={}).json()["last_plan"]["empty"]["B-001"] == {"CAN": 95}
+
+    moment += timedelta(minutes=4)
+    state = workspace(client)
+    bin = bin_by_id(state, "B-001")
+    assert bin["status"] == "offline" and bin["fill"] is None and not bin["partial_reading"]
+    assert all(v is None for v in bin["compartments"].values()) and state["last_plan"]["outdated"]
+    assert client.post("/api/collect/B-001", json={}).status_code == 422
+    assert "B-001" not in client.post("/api/plan", json={}).json()["last_plan"]["target_ids"]
+
+
+def test_legacy_sensor_timestamp_is_preserved_during_partial_update(client):
+    old = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+    with backend.database() as db:
+        user_id = db.execute("SELECT id FROM users WHERE email=?", (backend.DEMO_EMAIL,)).fetchone()[0]
+        state = backend.read_workspace(db, user_id)
+        bin = bin_by_id(state, "B-001")
+        backend.set_fills(bin, {"PET": 96})
+        bin.update(reading_source="actual", measured_at=old, received_at=old)
+        bin.pop("compartment_measured_at", None)
+        backend.save_workspace(db, user_id, state)
+    key = client.post("/api/device/key", json={}).json()["key"]
+    client.post("/api/device/readings", headers={"X-Device-Key": key},
+                json={"bin_id": "B-001", "compartment": "CAN", "fill_percent": 10})
+    bin = bin_by_id(workspace(client), "B-001")
+    assert bin["compartment_measured_at"]["PET"] == old
+    assert bin["compartments"]["PET"] is None and bin["last_compartments"]["PET"] == 96
+    assert bin["fill"] == 10 and bin["status"] == "normal"
+
+
+@pytest.mark.parametrize("mode", ["fastest", "lean"])
+def test_oversized_location_blocks_entire_plan_and_recovers_after_capacity_change(client, mode):
+    client.post("/api/demo/scenario", json={"scenario": "calm"})
+    client.patch("/api/bins/B-002", json={"fills": dict.fromkeys(backend.COMPARTMENTS, 100)})
+    client.patch("/api/bins/B-003", json={"fills": {"PET": 95}})
+    client.patch("/api/config", json={"cart_capacity": 1, "use_cart": True})
+    response = client.post("/api/plan", json={"route_mode": mode, "available_staff": 1})
+    assert response.status_code == 200
+    plan = response.json()["last_plan"]
+    assert plan["blocked_reason"] == "capacity" and not plan["routes"]
+    assert plan["capacity_issues"] == [{"bin_id": "B-002", "load": 4, "capacity": 1}]
+    assert set(plan["target_ids"]) == set(plan["unassigned"]) == {"B-002", "B-003"}
+    assert "B-002" in plan["issues"][0] and "4칸" in plan["issues"][0] and "1칸" in plan["issues"][0]
+    assert not workspace(client)["last_plan"]["outdated"]
+
+    assert client.patch("/api/config", json={"cart_capacity": 4}).json()["last_plan"]["outdated"]
+    recovered = client.post("/api/plan", json={}).json()["last_plan"]
+    assert not recovered.get("blocked_reason") and not recovered["unassigned"]
+    assert sorted(t for r in recovered["routes"] for t in r["bin_ids"]) == ["B-002", "B-003"]
+    for route in recovered["routes"]:
+        carried = 0
+        for stop in route["sequence"]:
+            if stop in recovered["empty"]:
+                carried += sum(recovered["empty"][stop].values()) / 100
+                assert carried <= 4 + 1e-9
+            else:
+                carried = 0

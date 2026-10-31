@@ -424,3 +424,9 @@ body:has(.draft-bar.floating) .toast{bottom:92px}
 .map-zoom button:disabled{opacity:.4;cursor:default}
 .building-map.zoomed svg{cursor:grab;touch-action:none}
 .building-map.zoomed svg:active{cursor:grabbing}
+
+/* Per-compartment sensor freshness. Historical readings never look like live values. */
+.compartment-row b.waiting-value{color:#78837c;font-size:11px;font-weight:500}
+.sensor-notice{margin:8px 0;color:#687267;font-size:12px;line-height:1.6}
+.sensor-notice>span{display:inline-block;padding:3px 8px;border-radius:6px;background:#f0f2ed}
+.sensor-notice p{margin:6px 0 0;font-size:12px;overflow-wrap:anywhere}

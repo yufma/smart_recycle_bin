@@ -12,6 +12,8 @@ export interface Building {
 export interface Bin {
   id: string; name: string; floor: number; x: number; y: number; access_node: string;
   fill: number | null; compartments: Fills; pending_compartments?: Compartment[]; device_type: 'real' | 'demo';
+  last_compartments?: Fills; compartment_measured_at?: Partial<Record<Compartment, string>>;
+  stale_compartments?: Compartment[]; partial_reading?: boolean;
   reading_source: 'actual' | 'simulated' | 'demo' | 'unconnected';
   measured_at: string | null; received_at: string | null; awaiting_confirmation: boolean; status: Status;
 }
@@ -32,6 +34,7 @@ export interface Plan {
   total_distance_m: number; makespan_seconds: number; method: string; outdated: boolean;
   end?: 'DEPOT' | 'OFFICE'; issues?: string[]; empty?: Record<string, Partial<Fills>>; total_seconds?: number; max_work_seconds?: number | null;
   comparison?: Record<RouteMode, { workers: number; total_distance_m: number; makespan_seconds: number; total_seconds?: number }>;
+  blocked_reason?: 'capacity'; capacity_issues?: { bin_id: string; load: number; capacity: number }[];
 }
 export interface CollectionLog {
   id: string; bin_id: string; floor: number; name: string; fill_before: number; emptied?: Partial<Fills>; worker: number | null;
