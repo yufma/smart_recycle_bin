@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Maximize2, ZoomIn, ZoomOut } from 'lucide-react';
 import type { PointerEvent as ReactPointerEvent } from 'react';
 import type { GraphNode, Route, Workspace } from './types';
-import { fillText, statusColor } from './types';
+import { fillText, statusColor, statusText } from './types';
 import { kindName, shortCode } from './graphTools';
 
 interface Props {
@@ -135,7 +135,7 @@ export default function MapView({ workspace: s, floor, routes = [], selectedBin,
   // markers keep their screen size on a zoomed map: each is shrunk back around its own position
   const keep = (x: number, y: number) => zoomed ? `translate(${x} ${y}) scale(${k}) translate(${-x} ${-y})` : undefined;
   return <div className="map-frame"><div className={`building-map ${editing ? 'editable' : ''} ${zoomed ? 'zoomed' : ''}`}>
-    <svg ref={svg} viewBox={`${left} ${top} ${1000 / view.scale} ${560 / view.scale}`} preserveAspectRatio="xMidYMid meet" role="img" aria-label={`${floor}층 쓰레기통 및 관리자실 배치도`}
+    <svg ref={svg} viewBox={`${left} ${top} ${1000 / view.scale} ${560 / view.scale}`} preserveAspectRatio="xMidYMid meet" role="group" aria-label={`${floor}층 쓰레기통 및 관리자실 배치도`}
       onClick={e => { if (!moveRef.current) { const p = point(e); onPlace?.(p.x, p.y); } moveRef.current = false; }}
       onPointerDown={e => { if (zoomed && !drag && e.button === 0) pan.current = { x: e.clientX, y: e.clientY, cx: view.cx, cy: view.cy, on: false, id: e.pointerId }; }}
       onPointerMove={e => {
@@ -190,7 +190,7 @@ export default function MapView({ workspace: s, floor, routes = [], selectedBin,
         const p = location(n.id, n.x, n.y);
         return showGraph ? <g key={n.id} transform={keep(px(p.x), py(p.y))} className="map-interactive" role="button" tabIndex={0} aria-label={`지점 ${n.id}`}
           onClick={e => { e.stopPropagation(); if (!moveRef.current) onNodeClick?.(n.id); }}
-          onKeyDown={e => { if (e.key === 'Enter') onNodeClick?.(n.id); }}
+          onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onNodeClick?.(n.id); } }}
           onPointerDown={e => startDrag(e, 'node', n.id, n.x, n.y)}>
           <circle cx={px(p.x)} cy={py(p.y)} r="10" fill={selectedNodes.includes(n.id) ? '#244b3d' : n.closed ? '#eef1ee' : '#fff'} stroke={n.closed ? '#a3aca6' : '#648b76'} strokeWidth="3" strokeDasharray={n.closed ? '4 3' : undefined} />
           {n.closed && <path d={`M ${px(p.x) - 5} ${py(p.y) - 5} l 10 10 M ${px(p.x) + 5} ${py(p.y) - 5} l -10 10`} stroke="#8d968f" strokeWidth="2" strokeLinecap="round" />}
@@ -203,7 +203,7 @@ export default function MapView({ workspace: s, floor, routes = [], selectedBin,
         const color = office ? '#244b3d' : '#33415c', width = Math.max(84, n.label.length * 16 + 22);
         return <g key={n.id} transform={keep(x, y)} className={`${office ? 'map-office' : 'map-depot'} ${showGraph ? 'map-interactive' : ''}`} role={showGraph ? 'button' : undefined} tabIndex={showGraph ? 0 : undefined} aria-label={showGraph ? `지점 ${n.id}` : undefined}
           onClick={e => { if (!showGraph) return; e.stopPropagation(); if (!moveRef.current) onNodeClick?.(n.id); }}
-          onKeyDown={e => { if (showGraph && e.key === 'Enter') onNodeClick?.(n.id); }}
+          onKeyDown={e => { if (showGraph && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); onNodeClick?.(n.id); } }}
           onPointerDown={e => { if (showGraph) startDrag(e, 'node', n.id, n.x, n.y); }}>
           {selectedNodes.includes(n.id) && <circle cx={x} cy={y} r="31" fill="none" stroke={color} strokeWidth="2" strokeDasharray="4 3" />}
           {office ? <circle cx={x} cy={y} r="24" fill={color} stroke="#fff" strokeWidth="4" /> : <rect x={x - 21} y={y - 21} width="42" height="42" rx="10" fill={color} stroke="#fff" strokeWidth="4" />}
@@ -217,9 +217,9 @@ export default function MapView({ workspace: s, floor, routes = [], selectedBin,
       {s.bins.filter(b => b.floor === floor).map(bin => {
         const p = location(bin.id, bin.x, bin.y);
         const assigned = routes.find(r => r.bin_ids.includes(bin.id));
-        return <g key={bin.id} transform={keep(px(p.x), py(p.y))} className="map-interactive" role="button" tabIndex={0} aria-label={`${bin.id} ${bin.fill ?? '미수신'}%`}
+        return <g key={bin.id} transform={keep(px(p.x), py(p.y))} className="map-interactive" role="button" tabIndex={0} aria-label={`${bin.id}, ${bin.name}, ${statusText[bin.status]}, ${bin.fill === null ? '측정값 없음' : bin.fill + '%'}, 상세 보기`}
           onClick={e => { e.stopPropagation(); if (!moveRef.current) onBinClick?.(bin.id); }}
-          onKeyDown={e => { if (e.key === 'Enter') onBinClick?.(bin.id); }}
+          onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onBinClick?.(bin.id); } }}
           onPointerDown={e => startDrag(e, 'bin', bin.id, bin.x, bin.y)}>
           {selectedBin === bin.id && <circle cx={px(p.x)} cy={py(p.y)} r="29" fill="none" stroke="#244b3d" strokeWidth="2" strokeDasharray="4 3" />}
           <circle cx={px(p.x)} cy={py(p.y)} r="21" fill={statusColor[bin.status]} stroke="white" strokeWidth="4" />
@@ -245,9 +245,9 @@ export default function MapView({ workspace: s, floor, routes = [], selectedBin,
     </svg>
   </div>
     <div className="map-zoom" role="group" aria-label="도면 확대·축소">
-      <button type="button" aria-label="확대" title="확대 (Ctrl + 휠)" disabled={view.scale >= MAX_ZOOM} onClick={() => zoomBy(1.5)}><ZoomIn size={16} /></button>
-      <button type="button" aria-label="축소" title="축소 (Ctrl + 휠)" disabled={!zoomed} onClick={() => zoomBy(1 / 1.5)}><ZoomOut size={16} /></button>
-      <button type="button" aria-label="전체 보기" title="전체 보기" disabled={!zoomed} onClick={() => setView({ scale: 1, cx: 500, cy: 280 })}><Maximize2 size={14} /></button>
+      <button type="button" aria-label="확대" title="확대 (Ctrl + 휠)" disabled={view.scale >= MAX_ZOOM} onClick={() => zoomBy(1.5)}><ZoomIn aria-hidden="true" size={16} /></button>
+      <button type="button" aria-label="축소" title="축소 (Ctrl + 휠)" disabled={!zoomed} onClick={() => zoomBy(1 / 1.5)}><ZoomOut aria-hidden="true" size={16} /></button>
+      <button type="button" aria-label="전체 보기" title="전체 보기" disabled={!zoomed} onClick={() => setView({ scale: 1, cx: 500, cy: 280 })}><Maximize2 aria-hidden="true" size={14} /></button>
     </div>
   </div>;
 }

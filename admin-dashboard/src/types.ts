@@ -81,12 +81,24 @@ export function duration(seconds: number) {
   return seconds < 60 ? `${Math.round(seconds)}초` : `${Math.floor(seconds / 60)}분 ${Math.round(seconds % 60)}초`;
 }
 export async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
-  const response = await fetch(`/api${path}`, { ...options, headers: { 'Content-Type': 'application/json', ...options.headers }, credentials: 'same-origin' });
-  if (!response.ok) {
-    const data = await response.json().catch(() => ({}));
-    const message = typeof data.detail === 'string' ? data.detail : '입력값을 확인한 뒤 다시 시도해 주세요.';
-    throw Object.assign(new Error(message), { status: response.status });
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), 30000);
+  try {
+    const response = await fetch(`/api${path}`, { ...options, signal: options.signal ?? controller.signal, headers: { 'Content-Type': 'application/json', ...options.headers }, credentials: 'same-origin' });
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}));
+      const message = typeof data.detail === 'string' ? data.detail : '입력값을 확인한 뒤 다시 시도해 주세요.';
+      throw Object.assign(new Error(message), { status: response.status });
+    }
+    return await response.json();
+  } catch (error) {
+    if (error instanceof Error && error.name === 'AbortError') {
+      throw new Error('서버 응답이 지연되고 있습니다. 최신 정보를 불러와 작업 반영 여부를 확인한 뒤 다시 시도해 주세요.');
+    }
+    if (error instanceof TypeError) throw new Error('서버에 연결할 수 없습니다. 서버 실행 상태를 확인한 뒤 다시 시도해 주세요.');
+    throw error;
+  } finally {
+    window.clearTimeout(timer);
   }
-  return response.json();
 }
 export function payload(data: unknown): RequestInit { return { method: 'POST', body: JSON.stringify(data) }; }
