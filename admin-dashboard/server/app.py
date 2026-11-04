@@ -680,7 +680,7 @@ class ConfigPatch(StrictModel):
     office_x: Optional[float] = Field(default=None, ge=0, le=100, allow_inf_nan=False)
     office_y: Optional[float] = Field(default=None, ge=0, le=100, allow_inf_nan=False)
     office_access_node: Optional[str] = Field(default=None, max_length=50)
-    meters_per_unit: Optional[float] = Field(default=None, ge=0.05, le=10, allow_inf_nan=False)
+    meters_per_unit: Optional[float] = Field(default=None, ge=0.05, le=20, allow_inf_nan=False)
     speed_mps: Optional[float] = Field(default=None, ge=0.2, le=3, allow_inf_nan=False)
     service_seconds: Optional[int] = Field(default=None, ge=0, le=600)
     compartment_seconds: Optional[int] = Field(default=None, ge=0, le=600)

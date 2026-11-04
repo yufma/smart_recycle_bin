@@ -231,11 +231,13 @@ export default function MapView({ workspace: s, floor, routes = [], selectedBin,
         </g>;
       })}
       {showGraph && <g className="map-codes" pointerEvents="none">{nodes.map(n => {
+        if (n.kind === 'corridor' && nodes.length > 40 && view.scale < 2 && !selectedNodes.includes(n.id)) return null;
+        const code = shortCode(n);
         // point codes go on top so the office, drop-off and bin markers never hide them
         const p = location(n.id, n.x, n.y);
         // a code goes under its point when a bin stands right above it, so the bin's name stays readable
         const below = !isPlace(n) && s.bins.some(b => b.floor === floor && Math.abs(b.x - n.x) < 5 && n.y - b.y > 0 && n.y - b.y < 14);
-        return <text key={n.id} transform={keep(px(p.x), py(p.y))} x={px(p.x)} y={py(p.y) + (below ? 29 : isPlace(n) ? -33 : -17)} textAnchor="middle" fontSize="14" fontWeight="700" fill="#2f4a3c" stroke="#fff" strokeWidth="4" strokeLinejoin="round" paintOrder="stroke">{shortCode(n)}</text>;
+        return <text key={n.id} transform={keep(px(p.x), py(p.y))} x={px(p.x)} y={py(p.y) + (below ? 29 : isPlace(n) ? -33 : -17)} textAnchor="middle" fontSize="14" fontWeight="700" fill="#2f4a3c" stroke="#fff" strokeWidth="4" strokeLinejoin="round" paintOrder="stroke">{code.length > 8 ? n.label : code}</text>;
       })}</g>}
       {/* the floor name and the scale stay put while the drawing is zoomed; the scale shows what 90 drawing units now cover */}
       <g transform={`translate(${left} ${top}) scale(${1 / view.scale})`} pointerEvents="none">
