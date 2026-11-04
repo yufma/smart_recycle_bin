@@ -19,6 +19,50 @@
   background: var(--canvas);
   color: var(--ink);
 }
+.workspace-label { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.workspace-label b { color: var(--green); font-size: 12px; }
+.building-manager-list { display: flex; flex-direction: column; gap: 10px; }
+.building-manager-row { display: flex; align-items: center; border: 1px solid var(--border); border-radius: 12px; padding: 8px; background: var(--surface); }
+.building-manager-row.current { background: #f0f5eb; border-color: #9cb49c; }
+.building-choice { display: flex; align-items: center; gap: 12px; padding: 8px; text-align: left; flex: 1; min-width: 0; min-height: 64px; }
+.building-choice-icon { color: var(--green); background: var(--canvas); width: 40px; height: 40px; border-radius: 10px; display: grid; place-items: center; flex-shrink: 0; }
+.building-choice>span:nth-child(2) { flex: 1; min-width: 0; }
+.building-choice strong { display: block; color: var(--ink); font-size: 14px; line-height: 1.6; overflow-wrap: anywhere; }
+.building-choice small { display: block; font-size: 12px; color: var(--muted); margin-top: 3px; }
+.building-current { display: flex; align-items: center; gap: 4px; color: var(--green); font-size: 11px; white-space: nowrap; }
+.building-row-actions { display: flex; gap: 2px; flex-shrink: 0; }
+.building-row-actions .icon-button { width: 36px; min-width: 36px; height: 40px; padding: 8px; }
+.building-add { margin-top: 16px; }
+.building-back { margin-bottom: 20px; }
+.building-create-form { display: flex; flex-direction: column; gap: 20px; }
+.building-create-form label { display: flex; flex-direction: column; gap: 8px; }
+.building-create-form small { color: var(--muted); line-height: 1.7; font-weight: 400; }
+.building-delete-confirm>strong { display: block; font-size: 18px; overflow-wrap: anywhere; margin-bottom: 14px; }
+.building-delete-confirm p { font-size: 14px; line-height: 1.9; margin-bottom: 14px; }
+.building-delete-button { background: var(--critical-ink); color: white; }
+.deleted-buildings { margin-top: 24px; border-top: 1px solid var(--border); padding-top: 16px; }
+.deleted-buildings summary { cursor: pointer; color: var(--muted); font-size: 13px; padding: 8px 0; }
+.deleted-buildings>div>div { display: flex; align-items: center; gap: 12px; padding: 12px 0; border-bottom: 1px solid var(--border); }
+.deleted-buildings>div>div>span { flex: 1; min-width: 0; }
+.deleted-buildings strong { display: block; font-size: 13px; overflow-wrap: anywhere; }
+.deleted-buildings small { display: block; font-size: 11px; color: var(--muted); margin-top: 4px; }
+.mobile-navigation small { display: block; font-size: 11px; margin-top: 4px; color: var(--muted); font-weight: 400; }
+.no-buildings-page { min-height: 100dvh; background: var(--canvas); }
+.no-buildings-page>header { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 28px; max-width: 1200px; margin: auto; }
+.no-buildings-page>main { text-align: center; padding: 80px 24px; max-width: 640px; margin: auto; }
+.no-buildings-icon { width: 88px; height: 88px; border-radius: 24px; display: grid; place-items: center; background: #e6efdf; color: var(--green); margin: 0 auto 28px; }
+.no-buildings-page h1 { font-size: 28px; margin-bottom: 14px; }
+.no-buildings-page p { color: var(--muted); font-size: 14px; line-height: 1.8; margin-bottom: 28px; }
+.no-buildings-page main>small { display: block; margin-top: 20px; color: var(--muted); }
+@media(max-width:480px) {
+  .building-manager-row { flex-wrap: wrap; }
+  .building-choice { flex-basis: 100%; }
+  .building-row-actions { width: 100%; justify-content: flex-end; border-top: 1px solid var(--border); padding-top: 4px; }
+  .building-row-actions .icon-button { width: 44px; min-width: 44px; height: 44px; }
+  .no-buildings-page>header { padding: 20px; }
+  .no-buildings-page .brand { font-size: 25px; }
+  .no-buildings-page h1 { font-size: 24px; }
+}
 body { background: var(--canvas); line-height: 1.5; -webkit-font-smoothing: antialiased; }
 h1,h2,h3 { text-wrap: balance; word-break: keep-all; }
 button,input,select { font-variant-numeric: tabular-nums; }

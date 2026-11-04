@@ -22,6 +22,7 @@ from typing import Annotated, Any, Literal, Optional
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
+from . import building_store
 
 from .sample_layout import (CIVIC_CORES, CIVIC_CORRIDOR, CIVIC_FILL_PATTERN, CIVIC_FLOORS, CIVIC_LINKS,
                             CIVIC_POINTS, CIVIC_ROOM_NAMES, CIVIC_ROOMS, civic_bin_at, LARGE_BINS, ROUND_CENTRES, ROUND_CORES,
@@ -391,7 +392,7 @@ def round_workspace() -> dict:
 
 
 def sample_floorplans(template: str) -> dict:
-    floors = {"large": LARGE_FLOORS, "library": LIBRARY_FLOORS, "civic": CIVIC_FLOORS, "round": ROUND_FLOORS}.get(template)
+    floors = {"large": LARGE_FLOORS, "library": LIBRARY_FLOORS, "civic": CIVIC_FLOORS, "round": ROUND_FLOORS, "inha": 1}.get(template)
     if not floors:
         return {}
     images = {}
@@ -423,12 +424,12 @@ def init_db():
                 device_key_hash TEXT UNIQUE
             );
         """)
+        building_store.install(db, now())
         if not db.execute("SELECT id FROM users WHERE email = ?", (DEMO_EMAIL,)).fetchone():
             salt = secrets.token_hex(16)
             cursor = db.execute("INSERT INTO users(email, name, salt, password_hash, created_at) VALUES(?,?,?,?,?)",
                                 (DEMO_EMAIL, "시연 관리자", salt, password_hash(DEMO_PASSWORD, salt), now()))
-            db.execute("INSERT INTO workspaces(user_id, state_json) VALUES(?,?)",
-                       (cursor.lastrowid, json.dumps(new_workspace(), ensure_ascii=False)))
+            building_store.create(db, cursor.lastrowid, new_workspace(), now())
         db.execute("DELETE FROM sessions WHERE expires_at < ?", (now(),))
 
 
@@ -465,16 +466,26 @@ def current_user(request: Request) -> dict:
     with database() as db:
         row = db.execute("SELECT u.id,u.email,u.name FROM sessions s JOIN users u ON u.id=s.user_id "
                          "WHERE s.token_hash=? AND s.expires_at>?", (hashed, now())).fetchone()
-    if not row:
-        raise HTTPException(401, "로그인이 만료되었습니다. 다시 로그인해 주세요.")
-    return dict(row)
+        if not row:
+            raise HTTPException(401, "로그인이 만료되었습니다. 다시 로그인해 주세요.")
+        user = dict(row)
+        requested = request.headers.get('X-Building-ID') or request.query_params.get('building_id')
+        if requested is not None:
+            if not requested.isdecimal() or int(requested) < 1:
+                raise HTTPException(422, '건물 번호를 확인해 주세요.')
+            user['building_id'] = building_store.owned(db, user['id'], int(requested))['id']
+        else:
+            user['building_id'] = building_store.selected(db, user['id'])
+        return user
 
 
-def read_workspace(db, user_id: int) -> dict:
-    row = db.execute("SELECT state_json FROM workspaces WHERE user_id=?", (user_id,)).fetchone()
-    if not row:
-        raise HTTPException(404, "건물 정보를 찾을 수 없습니다.")
-    state = json.loads(row[0])
+def read_workspace(db, user_id: int, workspace_id: int | None = None) -> dict:
+    workspace_id = workspace_id if workspace_id is not None else building_store.selected(db, user_id)
+    if workspace_id is None:
+        raise HTTPException(409, '관리할 건물을 먼저 추가해 주세요.')
+    row = building_store.owned(db, user_id, workspace_id)
+    state = json.loads(row['state_json'])
+    state['_workspace_id'] = workspace_id
     building = state["building"]
     # Workspaces saved before the travel-time model get its defaults; retired route modes fall back.
     building.pop("route_slack_percent", None)
@@ -531,11 +542,15 @@ def upgrade_points(state: dict) -> dict:
     return state
 
 
-def save_workspace(db, user_id: int, state: dict):
+def save_workspace(db, user_id: int, state: dict, workspace_id: int | None = None):
+    workspace_id = workspace_id or state.get('_workspace_id') or building_store.selected(db, user_id)
+    building_store.owned(db, user_id, workspace_id)
     state["revision"] = state.get("revision", 0) + 1
     state["updated_at"] = now()
-    db.execute("UPDATE workspaces SET state_json=? WHERE user_id=?",
-               (json.dumps(state, ensure_ascii=False, allow_nan=False), user_id))
+    saved = {k: v for k, v in state.items() if k != '_workspace_id'}
+    db.execute("UPDATE buildings SET state_json=? WHERE id=? AND user_id=? AND deleted_at IS NULL",
+               (json.dumps(saved, ensure_ascii=False, allow_nan=False), workspace_id, user_id))
+    state['_workspace_id'] = workspace_id
 
 
 def bin_status(bin: dict, config: dict, at: datetime | None = None) -> str:
@@ -575,21 +590,130 @@ def public_bin(bin: dict, config: dict, at: datetime | None = None) -> dict:
 
 def public_workspace(state: dict, user: dict) -> dict:
     result = copy.deepcopy(state)
+    result['workspace_id'] = result.pop('_workspace_id', None)
     at = datetime.now(timezone.utc)
     result["bins"] = [public_bin(bin, state["building"], at) for bin in state["bins"]]
     if result.get("last_plan"):
         result["last_plan"]["outdated"] = result["last_plan"]["signature"] != route_signature(state, at)
-    result["user"] = user
+    result["user"] = {k: user[k] for k in ('id', 'name', 'email')}
     return result
 
 
+def public_result(db, user: dict, state: dict | None = None):
+    metadata = {'buildings': building_store.summaries(db, user['id']),
+                'deleted_buildings': building_store.summaries(db, user['id'], deleted=True)}
+    if state is None:
+        if user.get('building_id') is None:
+            return {'user': {k: user[k] for k in ('id', 'name', 'email')},
+                    'workspace_id': None, 'building': None, **metadata}
+        state = read_workspace(db, user['id'], user['building_id'])
+    return public_workspace(state, user) | metadata
+
+
 def result_for(db, user: dict, state: dict):
-    save_workspace(db, user["id"], state)
-    return public_workspace(state, user)
+    save_workspace(db, user["id"], state, user.get('building_id'))
+    return public_result(db, user, state)
 
 
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+class BuildingName(StrictModel):
+    name: str = Field(min_length=1, max_length=80)
+
+
+class BuildingCreate(BuildingName):
+    template: Literal['empty', 'basic', 'inha', 'large', 'library', 'civic', 'round'] = 'empty'
+    floors: int = Field(default=1, ge=1, le=10)
+
+
+def building_template(template: str, floors=1) -> dict:
+    if template == 'inha':
+        from tools.build_inha_campus import build_workspaces, campus_data
+        state = build_workspaces(campus_data())[0]
+    elif template == 'empty':
+        state = new_workspace()
+        state['building'].update(floors=floors, office_access_node='', office_x=10, office_y=78)
+        state['graph'] = {'nodes': [
+            {'id': 'F1-N0', 'floor': 1, 'x': 50, 'y': 50, 'kind': 'corridor', 'label': '연결 통로'},
+            {'id': 'F1-OF1', 'floor': 1, 'x': 10, 'y': 78, 'kind': 'office', 'label': '위치 지정 전 관리자실'},
+            {'id': 'F1-DP1', 'floor': 1, 'x': 90, 'y': 78, 'kind': 'depot', 'label': '위치 지정 전 집하장'},
+        ], 'edges': []}
+        real = next(b for b in state['bins'] if b['device_type'] == 'real')
+        real.update(name='위치 지정 전 실물 장치', x=50, y=30, access_node='F1-N0')
+        state['bins'] = [real]
+    else:
+        state = {'large': large_workspace, 'library': library_workspace, 'civic': civic_workspace,
+                 'round': round_workspace}.get(template, new_workspace)()
+    state['map_images'] = sample_floorplans(template)
+    return state
+
+
+@app.get('/api/buildings')
+def get_buildings(user=Depends(current_user)):
+    with database() as db:
+        return {'items': building_store.summaries(db, user['id']),
+                'deleted_items': building_store.summaries(db, user['id'], deleted=True),
+                'active_id': user['building_id']}
+
+
+@app.post('/api/buildings', status_code=201)
+def add_building(body: BuildingCreate, user=Depends(current_user)):
+    name = body.name.strip()
+    if not name:
+        raise HTTPException(422, '건물 이름을 입력해 주세요.')
+    with LOCK, database() as db:
+        building_store.require_room(db, user['id'])
+        state = building_template(body.template, body.floors)
+        state['building']['name'] = name
+        user['building_id'] = building_store.create(db, user['id'], state, now())
+        return public_result(db, user)
+
+
+@app.post('/api/buildings/{building_id}/select')
+def select_building(building_id: int, user=Depends(current_user)):
+    with LOCK, database() as db:
+        building_store.choose(db, user['id'], building_id)
+        user['building_id'] = building_id
+        return public_result(db, user)
+
+
+@app.patch('/api/buildings/{building_id}')
+def rename_building(building_id: int, body: BuildingName, user=Depends(current_user)):
+    name = body.name.strip()
+    if not name:
+        raise HTTPException(422, '건물 이름을 입력해 주세요.')
+    with LOCK, database() as db:
+        state = read_workspace(db, user['id'], building_id)
+        state['building']['name'] = name
+        save_workspace(db, user['id'], state, building_id)
+        return public_result(db, user)
+
+
+@app.delete('/api/buildings/{building_id}')
+def delete_building(building_id: int, user=Depends(current_user)):
+    with LOCK, database() as db:
+        state = read_workspace(db, user['id'], building_id)
+        state['device_key_hint'] = None
+        save_workspace(db, user['id'], state, building_id)
+        db.execute('UPDATE buildings SET deleted_at=?,device_key_hash=NULL WHERE id=? AND user_id=?',
+                   (now(), building_id, user['id']))
+        if user['building_id'] == building_id:
+            user['building_id'] = building_store.selected(db, user['id'])
+        building_store.choose(db, user['id'], user['building_id'])
+        return public_result(db, user)
+
+
+@app.post('/api/buildings/{building_id}/restore')
+def restore_building(building_id: int, user=Depends(current_user)):
+    with LOCK, database() as db:
+        building_store.owned(db, user['id'], building_id, deleted=True)
+        building_store.require_room(db, user['id'])
+        db.execute('UPDATE buildings SET deleted_at=NULL WHERE id=? AND user_id=?', (building_id, user['id']))
+        building_store.choose(db, user['id'], building_id)
+        user['building_id'] = building_id
+        return public_result(db, user)
 
 
 class Login(StrictModel):
@@ -638,8 +762,7 @@ def register(body: Register, response: Response):
         cursor = db.execute("INSERT INTO users(email,name,salt,password_hash,created_at) VALUES(?,?,?,?,?)",
                             (email, name, salt, password_hash(body.password, salt), now()))
         user = {"id": cursor.lastrowid, "email": email, "name": name}
-        db.execute("INSERT INTO workspaces(user_id,state_json) VALUES(?,?)",
-                   (user["id"], json.dumps(new_workspace(), ensure_ascii=False)))
+        building_store.create(db, user['id'], new_workspace(), now())
         set_session(response, db, user["id"])
         return user
 
@@ -656,7 +779,7 @@ def logout(request: Request, response: Response):
 @app.get("/api/workspace")
 def get_workspace(user=Depends(current_user)):
     with database() as db:
-        return public_workspace(read_workspace(db, user["id"]), user)
+        return public_result(db, user)
 
 
 class ConfigPatch(StrictModel):
@@ -706,7 +829,7 @@ def validate_config(state: dict):
 @app.patch("/api/config")
 def update_config(body: ConfigPatch, user=Depends(current_user)):
     with LOCK, database() as db:
-        state = read_workspace(db, user["id"])
+        state = read_workspace(db, user["id"], user["building_id"])
         patch = body.model_dump(exclude_unset=True)
         if any(v is None for v in patch.values()):
             raise HTTPException(422, "설정값은 비워 둘 수 없습니다.")
@@ -752,7 +875,7 @@ def validate_bin(state: dict, bin: dict):
 @app.post("/api/bins", status_code=201)
 def create_bin(body: BinCreate, user=Depends(current_user)):
     with LOCK, database() as db:
-        state = read_workspace(db, user["id"])
+        state = read_workspace(db, user["id"], user["building_id"])
         if len(state["bins"]) >= 100:
             raise HTTPException(422, "MVP에서는 쓰레기통을 최대 100개 등록할 수 있습니다.")
         if body.device_type == "real" and any(b["device_type"] == "real" for b in state["bins"]):
@@ -775,7 +898,7 @@ def create_bin(body: BinCreate, user=Depends(current_user)):
 @app.patch("/api/bins/{bin_id}")
 def update_bin(bin_id: str, body: BinPatch, user=Depends(current_user)):
     with LOCK, database() as db:
-        state = read_workspace(db, user["id"])
+        state = read_workspace(db, user["id"], user["building_id"])
         bin = find_bin(state, bin_id)
         patch = body.model_dump(exclude_unset=True)
         if any(v is None for v in patch.values()):
@@ -794,7 +917,7 @@ def update_bin(bin_id: str, body: BinPatch, user=Depends(current_user)):
 @app.delete("/api/bins/{bin_id}")
 def delete_bin(bin_id: str, user=Depends(current_user)):
     with LOCK, database() as db:
-        state = read_workspace(db, user["id"])
+        state = read_workspace(db, user["id"], user["building_id"])
         bin = find_bin(state, bin_id)
         if bin["device_type"] == "real":
             raise HTTPException(422, "실물 시연 장치는 유지해 주세요.")
@@ -849,7 +972,7 @@ def validate_graph(graph: dict, floors: int):
 @app.put("/api/graph")
 def update_graph(body: Graph, user=Depends(current_user)):
     with LOCK, database() as db:
-        state = read_workspace(db, user["id"])
+        state = read_workspace(db, user["id"], user["building_id"])
         graph = body.model_dump(by_alias=True)
         validate_graph(graph, state["building"]["floors"])
         state["graph"] = graph
@@ -1308,7 +1431,7 @@ class PlanRequest(StrictModel):
 @app.post("/api/plan")
 def plan(body: PlanRequest, user=Depends(current_user)):
     with LOCK, database() as db:
-        state = read_workspace(db, user["id"])
+        state = read_workspace(db, user["id"], user["building_id"])
         state["building"].update({k: v for k, v in body.model_dump(exclude_unset=True).items() if v is not None})
         validate_config(state)
         state["last_plan"] = calculate_plan(state)
@@ -1322,7 +1445,7 @@ class CollectRequest(StrictModel):
 @app.post("/api/collect/{bin_id}")
 def collect(bin_id: str, body: CollectRequest, user=Depends(current_user)):
     with LOCK, database() as db:
-        state = read_workspace(db, user["id"])
+        state = read_workspace(db, user["id"], user["building_id"])
         bin = find_bin(state, bin_id)
         at = datetime.now(timezone.utc)
         current = public_bin(bin, state["building"], at)
@@ -1356,7 +1479,7 @@ def scenario(body: Scenario, user=Depends(current_user)):
               "rush": [98, 86, 92, 97, 91, 88, 83, 96, 95, 89, 93],
               "calm": [24, 43, 34, 17, 65, 28, 35, 46, 32, 58, 21]}
     with LOCK, database() as db:
-        state = read_workspace(db, user["id"])
+        state = read_workspace(db, user["id"], user["building_id"])
         index = 0
         for bin in state["bins"]:
             if bin["device_type"] == "demo":
@@ -1375,7 +1498,7 @@ class Simulation(StrictModel):
 @app.post("/api/demo/real-simulation")
 def real_simulation(body: Simulation, user=Depends(current_user)):
     with LOCK, database() as db:
-        state = read_workspace(db, user["id"])
+        state = read_workspace(db, user["id"], user["building_id"])
         bin = next((b for b in state["bins"] if b["device_type"] == "real"), None)
         if not bin:
             raise HTTPException(404, "실물 장치가 없습니다.")
@@ -1399,7 +1522,7 @@ class DemoReset(StrictModel):
 @app.post("/api/demo/reset")
 def reset_demo(body: DemoReset, user=Depends(current_user)):
     with LOCK, database() as db:
-        old_state = read_workspace(db, user["id"])
+        old_state = read_workspace(db, user["id"], user["building_id"])
         state = {"large": large_workspace, "library": library_workspace, "civic": civic_workspace,
                  "round": round_workspace}.get(body.template, new_workspace)()
         state["map_images"] = sample_floorplans(body.template)
@@ -1411,10 +1534,10 @@ def reset_demo(body: DemoReset, user=Depends(current_user)):
 def create_device_key(user=Depends(current_user)):
     key = "rl_" + secrets.token_urlsafe(32)
     with LOCK, database() as db:
-        state = read_workspace(db, user["id"])
+        state = read_workspace(db, user["id"], user["building_id"])
         state["device_key_hint"] = key[-6:]
-        db.execute("UPDATE workspaces SET device_key_hash=? WHERE user_id=?",
-                   (hashlib.sha256(key.encode()).hexdigest(), user["id"]))
+        db.execute("UPDATE buildings SET device_key_hash=? WHERE id=? AND user_id=?",
+                   (hashlib.sha256(key.encode()).hexdigest(), user["building_id"], user["id"]))
         save_workspace(db, user["id"], state)
     return {"key": key, "hint": key[-6:]}
 
@@ -1432,11 +1555,11 @@ def device_reading(body: DeviceReading, x_device_key: str = Header(default="", m
     if not x_device_key:
         raise HTTPException(401, "X-Device-Key 헤더가 필요합니다.")
     with LOCK, database() as db:
-        row = db.execute("SELECT user_id FROM workspaces WHERE device_key_hash=?",
+        row = db.execute("SELECT id,user_id FROM buildings WHERE device_key_hash=? AND deleted_at IS NULL",
                          (hashlib.sha256(x_device_key.encode()).hexdigest(),)).fetchone()
         if not row:
             raise HTTPException(401, "장치 연결 키를 확인해 주세요.")
-        state = read_workspace(db, row["user_id"])
+        state = read_workspace(db, row["user_id"], row["id"])
         bin = find_bin(state, body.bin_id)
         if bin["device_type"] != "real":
             raise HTTPException(422, "실물로 등록된 쓰레기통만 센서값을 수신합니다.")
@@ -1466,7 +1589,7 @@ def device_reading(body: DeviceReading, x_device_key: str = Header(default="", m
                    awaiting_confirmation=still_pending, pending_compartments=sorted(pending) if still_pending else [])
         state["readings"].insert(0, {"bin_id": bin["id"], "fill": bin["fill"], "fills": fills, "source": "actual", "at": now()})
         state["readings"] = state["readings"][:200]
-        save_workspace(db, row["user_id"], state)
+        save_workspace(db, row["user_id"], state, row["id"])
     current = public_bin(bin, state["building"])
     return {"ok": True, "bin_id": body.bin_id, "compartments": current["compartments"], "fill_percent": current["fill"],
             "stale_compartments": current["stale_compartments"], "partial_reading": current["partial_reading"],
@@ -1480,7 +1603,7 @@ class MapImage(StrictModel):
 @app.put("/api/floorplan/{floor}")
 def upload_floorplan(floor: int, body: MapImage, user=Depends(current_user)):
     with LOCK, database() as db:
-        state = read_workspace(db, user["id"])
+        state = read_workspace(db, user["id"], user["building_id"])
         if floor < 1 or floor > state["building"]["floors"]:
             raise HTTPException(422, "건물에 없는 층입니다.")
         if body.data_url is None:
@@ -1510,7 +1633,7 @@ def upload_floorplan(floor: int, body: MapImage, user=Depends(current_user)):
 @app.get("/api/floorplan/{floor}")
 def get_floorplan(floor: int, user=Depends(current_user)):
     with database() as db:
-        state = read_workspace(db, user["id"])
+        state = read_workspace(db, user["id"], user["building_id"])
         name = state["map_images"].get(str(floor))
         if not name or Path(name).name != name or not (MAP_DIR / name).is_file():
             raise HTTPException(404, "등록한 도면이 없습니다.")
@@ -1520,8 +1643,9 @@ def get_floorplan(floor: int, user=Depends(current_user)):
 @app.get("/api/backup")
 def backup(user=Depends(current_user)):
     with database() as db:
-        state = read_workspace(db, user["id"])
+        state = read_workspace(db, user["id"], user["building_id"])
     state.pop("device_key_hint", None)
+    state.pop("_workspace_id", None)
     state["last_plan"] = None
     images = {}
     for floor, name in state.get("map_images", {}).items():
@@ -1622,7 +1746,7 @@ def restore(body: RestoreRequest, user=Depends(current_user)):
         state["map_images"][floor] = name
         images_to_write.append((name, raw))
     with LOCK, database() as db:
-        old = read_workspace(db, user["id"])
+        old = read_workspace(db, user["id"], user["building_id"])
         state["device_key_hint"] = old.get("device_key_hint")
         for name, raw in images_to_write:
             (MAP_DIR / name).write_bytes(raw)

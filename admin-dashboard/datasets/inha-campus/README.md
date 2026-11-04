@@ -4,7 +4,7 @@
 **실제 자료는 길·건물·위경도이며, 실제 쓰레기통 위치나 적재율을 수집한 데이터가 아니다.**
 쓰레기통과 관리자실·집하장 위치는 사용자가 직접 지정한다.
 
-앱은 [codex/inha-real-map-test 브랜치](https://github.com/yufma/smart_recycle_bin/tree/codex/inha-real-map-test)를 사용한다.
+앱은 [codex/manage-buildings 브랜치](https://github.com/yufma/smart_recycle_bin/tree/codex/manage-buildings)를 사용한다.
 이전 버전은 캠퍼스 축척(15.65m/단위)이 허용 범위를 넘어 복원되지 않을 수 있다.
 
 ## 확보한 자료
@@ -25,6 +25,10 @@
 
 ## 앱에 넣기
 
+가장 간단한 방법은 **관리 중인 건물 → 건물 추가 → 인하대학교 캠퍼스**를 선택하는 것이다.
+기존 미래관과 별개 건물로 실제 지도·길을 추가하며, 쓰레기통은 직접 배치한다.
+직접 만든 복원 파일을 사용할 때도 새 건물을 먼저 추가하고 그 건물을 선택한 상태에서 복원한다.
+
 `admin-dashboard`에서 다음 명령으로 복원 파일과 지도 이미지를 만든다. 기존 계정이나 서버 데이터는 변경하지 않는다.
 
 ```powershell
@@ -34,13 +38,13 @@ python tools\build_inha_campus.py --output data\inha-export
 
 Pillow와 한글 TTF 글꼴이 필요하다. 다른 OS에서는 `--font <한글 TTF 경로>`를 지정한다.
 
-- `inha-campus-manual.json`: **직접 배치용**. 별도 계정으로 로그인하고 설정 → 백업 복원에서 선택한다.
+- `inha-campus-manual.json`: **직접 배치용**. 추가한 건물을 선택하고 설정 → 백업 복원에서 선택한다.
 - `inha-campus-manual.png`: 같은 축척의 실제 지도 배경.
 - `inha-walkways.geojson`: 위경도와 구간 거리, 원본 OSM way/node 번호가 있는 길 데이터.
 - `provenance.json`: 출처·범위·변환 정보.
 - `inha-campus-example.json`, `example-sites.csv`: **자동 검증 전용**. 가상의 수거 지점·적재율·거점으로 경로를 확인한 자료이며 실제 쓰레기통으로 사용하지 않는다.
 
-사용할 계정의 기존 자료가 있다면 먼저 백업한다. 복원은 해당 계정의 배치와 기록을 교체한다.
+기존 자료가 있다면 먼저 백업한다. 복원은 현재 선택한 건물의 배치와 기록을 교체한다.
 
 ## 직접 수거 위치 지정하기
 

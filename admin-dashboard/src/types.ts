@@ -2,6 +2,10 @@ export type Page = 'dashboard' | 'map' | 'team' | 'history' | 'device' | 'settin
 export type Status = 'normal' | 'warning' | 'critical' | 'offline' | 'pending';
 export type RouteMode = 'fastest' | 'lean';
 export interface User { id: number; name: string; email: string }
+export interface BuildingSummary { id: number; name: string; floors: number; bin_count: number; updated_at: string; deleted_at: string | null }
+export interface BuildingContext { user: User; buildings: BuildingSummary[]; deleted_buildings: BuildingSummary[] }
+export interface EmptyWorkspace extends BuildingContext { workspace_id: null; building: null }
+export type WorkspaceResponse = Workspace | EmptyWorkspace;
 export interface Building {
   name: string; floors: number; total_staff: number; available_staff: number;
   include_orange: boolean; route_mode?: RouteMode; meters_per_unit: number; speed_mps: number;
@@ -41,7 +45,8 @@ export interface CollectionLog {
   actor: string; source: string; completed_at: string;
 }
 export interface Reading { bin_id: string; fill: number | null; fills?: Partial<Fills> | null; source: string; at: string }
-export interface Workspace {
+export interface Workspace extends BuildingContext {
+  workspace_id: number;
   user: User; building: Building; bins: Bin[]; graph: Graph; map_images: Record<string, string>;
   logs: CollectionLog[]; readings: Reading[]; last_plan: Plan | null; device_key_hint: string | null;
   revision: number; updated_at: string;

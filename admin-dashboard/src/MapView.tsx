@@ -155,7 +155,7 @@ export default function MapView({ workspace: s, floor, routes = [], selectedBin,
       </defs>
       <rect width="1000" height="560" fill="#f7f9f6" />
       <rect width="1000" height="560" fill="url(#map-grid)" />
-      {floorImage ? <image href={`/api/floorplan/${floor}?v=${floorImage}`} x="50" y="45" width="900" height="460" preserveAspectRatio="xMidYMid meet" opacity="0.72" /> : <g className="blueprint">
+      {floorImage ? <image href={`/api/floorplan/${floor}?building_id=${s.workspace_id}&v=${floorImage}`} x="50" y="45" width="900" height="460" preserveAspectRatio="xMidYMid meet" opacity="0.72" /> : <g className="blueprint">
         <rect x="50" y="45" width="900" height="460" rx="5" fill="#fcfdfb" stroke="#ced8d0" strokeWidth="3" />
         <rect x="52" y="225" width="896" height="100" fill="#edf1eb" />
         {[50, 280, 510, 740].map((x, i) => <g key={x}>
