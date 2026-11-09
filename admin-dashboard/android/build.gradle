@@ -1,0 +1,4 @@
+plugins {
+    // the version already in the local Gradle cache, so the app builds offline
+    id 'com.android.application' version '9.4.0' apply false
+}

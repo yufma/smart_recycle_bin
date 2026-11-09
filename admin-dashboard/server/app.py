@@ -9,17 +9,28 @@ import hmac
 import json
 import math
 import os
+import random
 import secrets
 import sqlite3
 import threading
+import time
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Literal, Optional
+from typing import Annotated, Any, Literal, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field
+from . import account_store, building_store
+
+from .sample_layout import (CIVIC_CORES, CIVIC_CORRIDOR, CIVIC_FILL_PATTERN, CIVIC_FLOORS, CIVIC_LINKS,
+                            CIVIC_POINTS, CIVIC_ROOM_NAMES, CIVIC_ROOMS, civic_bin_at, LARGE_BINS, ROUND_CENTRES, ROUND_CORES,
+                            ROUND_FILL_PATTERN, ROUND_FLOORS, ROUND_INNER_U, ROUND_M_PER_PX, ROUND_OUTER_U,
+                            ROUND_POINTS, ROUND_RADIALS, ROUND_RADII, ROUND_ROOM_NAMES, ROUND_ROOMS, round_at, round_bin_at,
+                            round_door, round_nearest, round_px, LARGE_CORES, LARGE_CORRIDOR_X, LARGE_CORRIDORS, LARGE_DEPOT, LARGE_FILLS,
+                            LARGE_FLOORS, LARGE_OFFICE, LARGE_ROOMS, LIBRARY_CORES, LIBRARY_FLOORS, LIBRARY_POINTS,
+                            LIBRARY_RING, LIBRARY_ROOM_NAMES, LIBRARY_ROOMS, large_room_label, library_fill)
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = Path(os.environ.get("RELOOP_DATA_DIR", str(ROOT / "data")))
@@ -30,6 +41,52 @@ COOKIE = "reloop_session"
 DEMO_EMAIL = "demo@reloop.local"
 DEMO_PASSWORD = "Demo1234!"
 ROUTE_COLORS = ["#3976db", "#9266ce", "#1d9caa", "#bf648f", "#6073a3", "#9b7946"]
+# Route presets. fastest: the earliest time by which every collection is done; lean: the fewest
+# workers, then the least total working time. Both keep within the cart capacity and the per-person
+# working-time cap, and end each trip at the drop-off point (분리수거장, or the office if none is set).
+RouteMode = Literal["fastest", "lean"]
+# Travel-time defaults are assumptions to be replaced by on-site measurements.
+ROUTE_DEFAULTS = {"route_mode": "fastest", "stairs_up_seconds": 20, "stairs_down_seconds": 14,
+                  "elevator_wait_seconds": 40, "elevator_floor_seconds": 4, "use_cart": False,
+                  "cart_capacity": 4, "depot_node": "", "unload_seconds": 60, "max_work_minutes": 20,
+                  "compartment_seconds": 15}
+# One location holds four compartments, as the device sorts them: 캔, PET, 유리, 일반. Each has its own
+# sensor value; the location's fill (and so its status) is its fullest compartment.
+COMPARTMENTS = ("CAN", "PET", "GLASS", "OTHER")
+Compartment = Literal["CAN", "PET", "GLASS", "OTHER"]
+Percent = Annotated[float, Field(ge=0, le=100, allow_inf_nan=False)]
+OLD_CATEGORY = {"PET": "PET", "캔": "CAN", "유리": "GLASS", "일반": "OTHER", "혼합": "OTHER"}
+CART_SPEED_RATIO = 0.85  # walking speed with a loaded cart
+# The map draws its 0-100 units on a 900 x 460 pixel plan, so a unit down is shorter than a unit across.
+# Distances are measured as drawn; meters_per_unit is the scale across.
+MAP_Y_SCALE = 460 / 900
+
+
+def nonzero_floor(value: int) -> int:
+    if value == 0:
+        raise ValueError("0층은 없습니다. 지하는 -1부터 입력해 주세요.")
+    return value
+
+
+FloorNumber = Annotated[int, Field(ge=-5, le=10), AfterValidator(nonzero_floor)]
+
+
+def has_floor(config: dict, floor: int) -> bool:
+    return 1 <= floor <= config["floors"] or -config.get("basement_floors", 0) <= floor <= -1
+
+
+def floor_level(floor: int) -> int:
+    # B1 to 1F is one storey; there is no ground-floor zero in Korean floor numbers.
+    return floor if floor < 0 else floor - 1
+
+
+def map_distance(a: dict, b: dict, meters_per_unit: float) -> float:
+    return math.hypot(a["x"] - b["x"], (a["y"] - b["y"]) * MAP_Y_SCALE) * meters_per_unit
+CAR = "~car"  # suffix of the car twin of each lift node
+# Search effort per preset: up to SEARCH_RESTARTS runs of base rounds plus rounds per stop, within a
+# time budget in seconds.
+SEARCH_ROUNDS, SEARCH_ROUNDS_PER_STOP, SEARCH_SECONDS, SEARCH_RESTARTS = 600, 20, 0.6, 4
+SEARCH_HEAT = 0.01  # starting annealing temperature as a share of the first plan's time
 
 
 def now() -> str:
@@ -65,6 +122,49 @@ def password_hash(password: str, salt: str) -> str:
     return hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt), 310_000).hex()
 
 
+def set_fills(bin: dict, fills: dict) -> dict:
+    """Update some compartments (None = no value yet); the location's fill is its fullest compartment."""
+    current = dict.fromkeys(COMPARTMENTS) | (bin.get("compartments") or {})
+    current.update({c: None if v is None else round(float(v), 1) for c, v in fills.items()})
+    bin["compartments"] = {c: current[c] for c in COMPARTMENTS}
+    known = [v for v in bin["compartments"].values() if v is not None]
+    bin["fill"] = max(known) if known else None
+    return bin
+
+
+def demo_fills(level: float, index: int) -> dict:
+    """Demo values: the fullest compartment keeps the given level, so the location's status matches it;
+    the others trail behind, and which compartment is fullest rotates from location to location."""
+    drops = (0, 12, 35, 55)
+    return {c: max(3.0, level - drops[(k - index) % 4]) for k, c in enumerate(COMPARTMENTS)}
+
+
+def sample_fills(level, index: int) -> dict:
+    # a real device has no values until it reports
+    return set_fills({}, dict.fromkeys(COMPARTMENTS) if level is None else demo_fills(level, index))
+
+
+def current_fills(bin: dict, config: dict, at: datetime | None = None) -> dict:
+    """Operational values only. Keep raw readings in storage, but never refresh one compartment
+    with another's timestamp. Older single-timestamp workspaces use their original measurement time."""
+    values = dict.fromkeys(COMPARTMENTS) | (bin.get("compartments") or {})
+    if bin["reading_source"] != "actual":
+        return values
+    cutoff = (at or datetime.now(timezone.utc)) - timedelta(minutes=config["stale_minutes"])
+    times = bin.get("compartment_measured_at")
+    for compartment, value in values.items():
+        stamp = times.get(compartment) if times is not None else bin.get("measured_at")
+        if value is not None and (not stamp or parse_time(stamp) < cutoff):
+            values[compartment] = None
+    return values
+
+
+def to_empty(bin: dict, config: dict, at: datetime | None = None) -> dict:
+    """Compartments emptied on a visit: every one at the warning level or above (all of them if none is)."""
+    known = {c: v for c, v in current_fills(bin, config, at).items() if v is not None}
+    return {c: v for c, v in known.items() if v >= config["warning_threshold"]} or known
+
+
 def new_workspace() -> dict:
     nodes, edges, bins = [], [], []
     levels = [(None, 94, 43, 84), (97, 65, 88, 35), (76, 92, 58, 81)]
@@ -87,24 +187,240 @@ def new_workspace() -> dict:
             bins.append({"id": f"B-{number:03}", "name": names[index], "floor": floor,
                          "x": x, "y": 29 if index % 2 == 0 else 72,
                          "access_node": f"F{floor}-N{index+1}",
-                         "category": ["PET", "캔", "일반", "혼합"][index],
-                         "fill": levels[floor-1][index], "device_type": "real" if number == 1 else "demo",
+                         **sample_fills(None if number == 1 else levels[floor-1][index], number),
+                         "device_type": "real" if number == 1 else "demo",
                          "reading_source": "unconnected" if number == 1 else "demo",
                          "measured_at": None if number == 1 else stamp,
                          "received_at": None if number == 1 else stamp,
                          "awaiting_confirmation": False})
     return {
         "building": {"name": "인하대학교 · 미래관", "floors": 3,
-                     "total_staff": 3, "available_staff": 2, "include_orange": False,
+                     "total_staff": 3, "available_staff": 2, "include_orange": False, **ROUTE_DEFAULTS,
                      "office_floor": 1, "office_x": 10, "office_y": 78,
                      "office_access_node": "F1-N0", "meters_per_unit": 0.6,
                      "speed_mps": 1.0, "service_seconds": 45,
                      "warning_threshold": 80, "critical_threshold": 90,
                      "stale_minutes": 5},
-        "bins": bins, "graph": {"nodes": nodes, "edges": edges},
-        "map_images": {}, "logs": [], "readings": [], "last_plan": None,
+        "bins": bins, "graph": {"nodes": nodes + [
+            {"id": "F1-OF1", "floor": 1, "x": 10, "y": 78, "kind": "office", "label": "관리자실"},
+            {"id": "F1-DP1", "floor": 1, "x": 90, "y": 88, "kind": "depot", "label": "분리수거장"}],
+            "edges": edges + [{"id": "E-F1-N0-F1-OF1", "from": "F1-N0", "to": "F1-OF1", "distance_m": None},
+                              {"id": "E-F1-N4-F1-DP1", "from": "F1-N4", "to": "F1-DP1", "distance_m": None}]},
+        "graph_version": 2, "map_images": {}, "logs": [], "readings": [], "last_plan": None,
         "device_key_hint": None, "revision": 1, "updated_at": stamp,
     }
+
+
+# Floor plans drawn by tools/make_large_floorplans.py for the large sample building.
+SAMPLE_DIR = ROOT / "server" / "samples"
+
+
+def large_workspace() -> dict:
+    state = new_workspace()
+    nodes, edges, bins = [], [], []
+    stamp = state["updated_at"]
+    for floor in range(1, LARGE_FLOORS + 1):
+        for side, y, name in LARGE_CORRIDORS:
+            for index, x in enumerate(LARGE_CORRIDOR_X):
+                nodes.append({"id": f"F{floor}-{side}{index}", "floor": floor, "x": x, "y": y,
+                              "kind": "corridor", "label": f"{name} 복도 {index + 1}"})
+                if index:
+                    edges.append({"id": f"E{floor}-{side}{index}", "from": f"F{floor}-{side}{index-1}",
+                                  "to": f"F{floor}-{side}{index}", "distance_m": None})
+        for core, x, kind, label, rise in LARGE_CORES:
+            node_id = f"F{floor}-{core}"
+            index = LARGE_CORRIDOR_X.index(x)
+            nodes.append({"id": node_id, "floor": floor, "x": x, "y": 50, "kind": kind, "label": label})
+            edges += [{"id": f"E{floor}-{core}-N", "from": f"F{floor}-N{index}", "to": node_id, "distance_m": None},
+                      {"id": f"E{floor}-{core}-S", "from": node_id, "to": f"F{floor}-S{index}", "distance_m": None}]
+            if floor > 1:
+                edges.append({"id": f"{core}-{floor}", "from": f"F{floor-1}-{core}", "to": node_id, "distance_m": rise})
+        for index, (x, y, access, room) in enumerate(LARGE_BINS):
+            number = (floor - 1) * len(LARGE_BINS) + index + 1
+            bins.append({"id": f"B-{number:03}", "name": f"{large_room_label(LARGE_ROOMS[room], floor)} 앞",
+                         "floor": floor, "x": x, "y": y, "access_node": f"F{floor}-{access}",
+                         **sample_fills(None if number == 1 else LARGE_FILLS[floor-1][index], number),
+                         "device_type": "real" if number == 1 else "demo",
+                         "reading_source": "unconnected" if number == 1 else "demo",
+                         "measured_at": None if number == 1 else stamp,
+                         "received_at": None if number == 1 else stamp, "awaiting_confirmation": False})
+    for kind, (x, y, access), label in (("office", LARGE_OFFICE, "관리자실"), ("depot", LARGE_DEPOT, "분리수거장")):
+        node_id = f"F1-{'OF' if kind == 'office' else 'DP'}1"
+        nodes.append({"id": node_id, "floor": 1, "x": x, "y": y, "kind": kind, "label": label})
+        edges.append({"id": f"E-F1-{access}-{node_id}", "from": f"F1-{access}", "to": node_id, "distance_m": None})
+    office_x, office_y, office_access = LARGE_OFFICE
+    state["building"].update(name="예시 캠퍼스 · 종합관", floors=LARGE_FLOORS, total_staff=5, available_staff=3,
+                             office_x=office_x, office_y=office_y, office_access_node=f"F1-{office_access}",
+                             meters_per_unit=0.8)
+    state.update(bins=bins, graph={"nodes": nodes, "edges": edges})
+    return state
+
+
+def library_workspace() -> dict:
+    state = new_workspace()
+    nodes, edges, bins = [], [], []
+    stamp = state["updated_at"]
+    ring = [point for point, _, _ in LIBRARY_RING]
+    taken = {(floor, room) for floor, room, *_ in LIBRARY_POINTS}
+    for floor in range(1, LIBRARY_FLOORS + 1):
+        for index, (point, x, y) in enumerate(LIBRARY_RING):
+            side = {"N": "북쪽 복도", "S": "남쪽 복도", "W": "서쪽 복도", "E": "동쪽 복도"}[point[0]]
+            nodes.append({"id": f"F{floor}-{point}", "floor": floor, "x": x, "y": y, "kind": "corridor",
+                          "label": f"{side} {int(point[1:]) + 1}" if point[0] in "NS" else side})
+            after = ring[(index + 1) % len(ring)]
+            edges.append({"id": f"E{floor}-{point}-{after}", "from": f"F{floor}-{point}", "to": f"F{floor}-{after}", "distance_m": None})
+        for code, x, y, kind, label, door, rise in LIBRARY_CORES:
+            node_id = f"F{floor}-{code}"
+            nodes.append({"id": node_id, "floor": floor, "x": x, "y": y, "kind": kind, "label": label})
+            edges.append({"id": f"E-F{floor}-{door}-{node_id}", "from": f"F{floor}-{door}", "to": node_id, "distance_m": None})
+            if floor > 1:
+                edges.append({"id": f"V-F{floor-1}-{code}-{node_id}", "from": f"F{floor-1}-{code}", "to": node_id, "distance_m": rise})
+        for room, (_, door, (x, y)) in enumerate(LIBRARY_ROOMS):
+            if (floor, room) in taken:
+                continue
+            number = len(bins) + 1
+            bins.append({"id": f"B-{number:03}", "name": f"{LIBRARY_ROOM_NAMES[floor][room]} 앞",
+                         "floor": floor, "x": x, "y": y, "access_node": f"F{floor}-{door}",
+                         **sample_fills(None if number == 1 else library_fill(floor, room), number),
+                         "device_type": "real" if number == 1 else "demo",
+                         "reading_source": "unconnected" if number == 1 else "demo",
+                         "measured_at": None if number == 1 else stamp,
+                         "received_at": None if number == 1 else stamp, "awaiting_confirmation": False})
+    counts = {"office": 0, "depot": 0}
+    for floor, room, kind, (x, y), label in LIBRARY_POINTS:
+        counts[kind] += 1
+        node_id = f"F{floor}-{'OF' if kind == 'office' else 'DP'}{counts[kind]}"
+        door = f"F{floor}-{LIBRARY_ROOMS[room][1]}"
+        nodes.append({"id": node_id, "floor": floor, "x": x, "y": y, "kind": kind, "label": label})
+        edges.append({"id": f"E-{door}-{node_id}", "from": door, "to": node_id, "distance_m": None})
+    state["building"].update(name="예시 · 시립 중앙도서관", floors=LIBRARY_FLOORS, total_staff=6, available_staff=4,
+                             meters_per_unit=1.0)
+    state.update(bins=bins, graph={"nodes": nodes, "edges": edges})
+    return state
+
+
+def civic_workspace() -> dict:
+    state = new_workspace()
+    nodes, edges, bins = [], [], []
+    stamp = state["updated_at"]
+    taken = {(floor, room) for floor, room, *_ in CIVIC_POINTS}
+    for floor in range(1, CIVIC_FLOORS + 1):
+        here = {point for point, *_, top in CIVIC_CORRIDOR if floor <= top}
+        for point, x, y, label, top in CIVIC_CORRIDOR:
+            if point in here:
+                nodes.append({"id": f"F{floor}-{point}", "floor": floor, "x": x, "y": y, "kind": "corridor", "label": label})
+        for a, b in CIVIC_LINKS:
+            if a in here and b in here:
+                edges.append({"id": f"E{floor}-{a}-{b}", "from": f"F{floor}-{a}", "to": f"F{floor}-{b}", "distance_m": None})
+        for room, (rect, door, top, every_floor) in enumerate(CIVIC_ROOMS):
+            if floor > top or (floor, room) in taken or not (every_floor or floor == 1):
+                continue
+            number = len(bins) + 1
+            x, y = civic_bin_at(CIVIC_ROOMS[room])
+            bins.append({"id": f"B-{number:03}", "name": f"{CIVIC_ROOM_NAMES[floor][room]} 앞",
+                         "floor": floor, "x": x, "y": y, "access_node": f"F{floor}-{door}",
+                         **sample_fills(None if number == 1 else CIVIC_FILL_PATTERN[number % len(CIVIC_FILL_PATTERN)], number),
+                         "device_type": "real" if number == 1 else "demo",
+                         "reading_source": "unconnected" if number == 1 else "demo",
+                         "measured_at": None if number == 1 else stamp,
+                         "received_at": None if number == 1 else stamp, "awaiting_confirmation": False})
+    for code, x, y, kind, label, door, rise, top, closed in CIVIC_CORES:
+        # open stops are linked floor to floor; an out-of-service stop is skipped
+        below = None
+        for floor in range(1, top + 1):
+            node_id = f"F{floor}-{code}"
+            nodes.append({"id": node_id, "floor": floor, "x": x, "y": y, "kind": kind, "label": label, "closed": floor in closed})
+            edges.append({"id": f"E-F{floor}-{door}-{node_id}", "from": f"F{floor}-{door}", "to": node_id, "distance_m": None})
+            if floor in closed:
+                continue
+            if below:
+                edges.append({"id": f"V-{below}-{node_id}", "from": below, "to": node_id,
+                              "distance_m": rise * (floor - int(below[1:below.index('-')]))})
+            below = node_id
+    counts = {"office": 0, "depot": 0}
+    for floor, room, kind, (x, y), label in CIVIC_POINTS:
+        counts[kind] += 1
+        node_id = f"F{floor}-{'OF' if kind == 'office' else 'DP'}{counts[kind]}"
+        door = f"F{floor}-{CIVIC_ROOMS[room][1]}"
+        nodes.append({"id": node_id, "floor": floor, "x": x, "y": y, "kind": kind, "label": label})
+        edges.append({"id": f"E-{door}-{node_id}", "from": door, "to": node_id, "distance_m": None})
+    state["building"].update(name="예시 · 시민 복합청사", floors=CIVIC_FLOORS, total_staff=8, available_staff=5,
+                             meters_per_unit=1.2)
+    state.update(bins=bins, graph={"nodes": nodes, "edges": edges})
+    return state
+
+
+def round_workspace() -> dict:
+    state = new_workspace()
+    nodes, edges, bins = [], [], []
+    stamp = state["updated_at"]
+    taken = {(floor, room) for floor, room, *_ in ROUND_POINTS}
+    places = {}  # node id -> plan pixels, to measure the links on the curved geometry
+
+    def link(edge_id, a, b):
+        (ax, ay), (bx, by) = places[a], places[b]
+        edges.append({"id": edge_id, "from": a, "to": b, "distance_m": max(0.1, round(math.hypot(ax - bx, ay - by) * ROUND_M_PER_PX, 1))})
+
+    def point(node_id, floor, u, radius, kind, label):
+        x, y = round_at(u, radius)
+        places[node_id] = round_px(u, radius)
+        nodes.append({"id": node_id, "floor": floor, "x": x, "y": y, "kind": kind, "label": label})
+
+    for floor in range(1, ROUND_FLOORS + 1):
+        # the curved corridors: closely spaced points joined in a ring
+        for ring, spots, radius, name in (("OR", ROUND_OUTER_U, ROUND_RADII["outer_corridor"], "바깥 곡선 복도"),
+                                          ("IR", ROUND_INNER_U, ROUND_RADII["inner_corridor"], "안쪽 곡선 복도")):
+            for k, u in enumerate(spots):
+                point(f"F{floor}-{ring}{k}", floor, u, radius, "corridor", f"{name} {k + 1}")
+            for k in range(len(spots)):
+                link(f"E{floor}-{ring}{k}", f"F{floor}-{ring}{k}", f"F{floor}-{ring}{(k + 1) % len(spots)}")
+        for u in ROUND_RADIALS:
+            link(f"E{floor}-RAD{ROUND_OUTER_U.index(u)}", f"F{floor}-IR{ROUND_INNER_U.index(u)}", f"F{floor}-OR{ROUND_OUTER_U.index(u)}")
+        for code, u, radius, kind, label in ROUND_CORES:
+            node_id = f"F{floor}-{code}"
+            point(node_id, floor, u, radius, kind, label)
+            link(f"E-F{floor}-{code}", f"F{floor}-OR{round_nearest(ROUND_OUTER_U, u)}", node_id)
+            if floor > 1:
+                edges.append({"id": f"V-F{floor-1}-{code}-{node_id}", "from": f"F{floor-1}-{code}", "to": node_id,
+                              "distance_m": 15.0 if kind == "elevator" else 12.0})
+        for room, spec in enumerate(ROUND_ROOMS):
+            if (floor, room) in taken:
+                continue
+            number = len(bins) + 1
+            x, y = round_bin_at(spec)
+            bins.append({"id": f"B-{number:03}", "name": f"{ROUND_ROOM_NAMES[floor][room]} 앞",
+                         "floor": floor, "x": x, "y": y, "access_node": f"F{floor}-{round_door(spec)}",
+                         **sample_fills(None if number == 1 else ROUND_FILL_PATTERN[number % len(ROUND_FILL_PATTERN)], number),
+                         "device_type": "real" if number == 1 else "demo",
+                         "reading_source": "unconnected" if number == 1 else "demo",
+                         "measured_at": None if number == 1 else stamp,
+                         "received_at": None if number == 1 else stamp, "awaiting_confirmation": False})
+    counts = {"office": 0, "depot": 0}
+    for floor, room, kind, u, radius, label in ROUND_POINTS:
+        counts[kind] += 1
+        node_id = f"F{floor}-{'OF' if kind == 'office' else 'DP'}{counts[kind]}"
+        point(node_id, floor, u, radius, kind, label)
+        door = f"F{floor}-{round_door(ROUND_ROOMS[room])}"
+        link(f"E-{door}-{node_id}", door, node_id)
+    # one map unit is 9 plan pixels across; bins and new links are measured with it
+    state["building"].update(name="예시 · 시립 곡선형 컨벤션센터", floors=ROUND_FLOORS, total_staff=8, available_staff=5,
+                             meters_per_unit=round(9 * ROUND_M_PER_PX, 2))
+    state.update(bins=bins, graph={"nodes": nodes, "edges": edges})
+    return state
+
+
+def sample_floorplans(template: str) -> dict:
+    floors = {"large": LARGE_FLOORS, "library": LIBRARY_FLOORS, "civic": CIVIC_FLOORS, "round": ROUND_FLOORS, "inha": 1}.get(template)
+    if not floors:
+        return {}
+    images = {}
+    for floor in range(1, floors + 1):
+        source = SAMPLE_DIR / f"{template}-floor-{floor}.png"
+        if source.is_file():
+            name = f"sample-{template}-{floor}.png"
+            (MAP_DIR / name).write_bytes(source.read_bytes())
+            images[str(floor)] = name
+    return images
 
 
 def init_db():
@@ -126,12 +442,13 @@ def init_db():
                 device_key_hash TEXT UNIQUE
             );
         """)
+        building_store.install(db, now())
+        account_store.install(db)
         if not db.execute("SELECT id FROM users WHERE email = ?", (DEMO_EMAIL,)).fetchone():
             salt = secrets.token_hex(16)
             cursor = db.execute("INSERT INTO users(email, name, salt, password_hash, created_at) VALUES(?,?,?,?,?)",
                                 (DEMO_EMAIL, "시연 관리자", salt, password_hash(DEMO_PASSWORD, salt), now()))
-            db.execute("INSERT INTO workspaces(user_id, state_json) VALUES(?,?)",
-                       (cursor.lastrowid, json.dumps(new_workspace(), ensure_ascii=False)))
+            building_store.create(db, cursor.lastrowid, new_workspace(), now())
         db.execute("DELETE FROM sessions WHERE expires_at < ?", (now(),))
 
 
@@ -141,7 +458,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Reloop Local MVP", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="inloop Local MVP", version="1.0.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -168,65 +485,284 @@ def current_user(request: Request) -> dict:
     with database() as db:
         row = db.execute("SELECT u.id,u.email,u.name FROM sessions s JOIN users u ON u.id=s.user_id "
                          "WHERE s.token_hash=? AND s.expires_at>?", (hashed, now())).fetchone()
-    if not row:
-        raise HTTPException(401, "로그인이 만료되었습니다. 다시 로그인해 주세요.")
-    return dict(row)
+        if not row:
+            raise HTTPException(401, "로그인이 만료되었습니다. 다시 로그인해 주세요.")
+        user = account_store.primary_user(db, row['id'])
+        requested = request.headers.get('X-Building-ID') or request.query_params.get('building_id')
+        if requested is not None:
+            if not requested.isdecimal() or int(requested) < 1:
+                raise HTTPException(422, '건물 번호를 확인해 주세요.')
+            user['building_id'] = building_store.owned(db, user['id'], int(requested))['id']
+        else:
+            user['building_id'] = building_store.selected(db, user['id'])
+        return user
 
 
-def read_workspace(db, user_id: int) -> dict:
-    row = db.execute("SELECT state_json FROM workspaces WHERE user_id=?", (user_id,)).fetchone()
-    if not row:
-        raise HTTPException(404, "건물 정보를 찾을 수 없습니다.")
-    return json.loads(row[0])
+def read_workspace(db, user_id: int, workspace_id: int | None = None) -> dict:
+    workspace_id = workspace_id if workspace_id is not None else building_store.selected(db, user_id)
+    if workspace_id is None:
+        raise HTTPException(409, '관리할 건물을 먼저 추가해 주세요.')
+    row = building_store.owned(db, user_id, workspace_id)
+    state = json.loads(row['state_json'])
+    state['_workspace_id'] = workspace_id
+    building = state["building"]
+    building.setdefault("basement_floors", 0)
+    building.setdefault("layout_note", "")
+    # Workspaces saved before the travel-time model get its defaults; retired route modes fall back.
+    building.pop("route_slack_percent", None)
+    for key, value in ROUTE_DEFAULTS.items():
+        building.setdefault(key, value)
+    if building["route_mode"] not in ("fastest", "lean"):
+        building["route_mode"] = ROUTE_DEFAULTS["route_mode"]
+    return upgrade_points(upgrade_bins(state))
 
 
-def save_workspace(db, user_id: int, state: dict):
+def upgrade_bins(state: dict) -> dict:
+    """Bins saved with one category and one fill get four compartments: the old fill goes to its
+    category's compartment and the others start empty (no value yet on a real device)."""
+    for bin in state["bins"]:
+        if "compartments" not in bin:
+            category = OLD_CATEGORY.get(bin.pop("category", ""), "OTHER")
+            fills = dict.fromkeys(COMPARTMENTS, None if bin["device_type"] == "real" else 0.0)
+            fills[category] = bin.get("fill")
+            set_fills(bin, fills)
+        if bin["reading_source"] == "actual" and "compartment_measured_at" not in bin:
+            bin["compartment_measured_at"] = {c: bin["measured_at"] for c, v in bin["compartments"].items()
+                                               if v is not None and bin.get("measured_at")}
+    return state
+
+
+def upgrade_points(state: dict) -> dict:
+    """Before version 2 a workspace kept one office in the building settings and named one corridor
+    point as the drop-off. Both become graph points (kinds office and depot), joined to the same
+    corridor points as before, so existing buildings keep their connections."""
+    if state.get("graph_version", 1) >= 2:
+        return state
+    b, graph = state["building"], state["graph"]
+    nodes = {n["id"]: n for n in graph["nodes"]}
+
+    def add(base, floor, x, y, kind, label, access):
+        k = 1
+        while f"{base}{k}" in nodes:
+            k += 1
+        node = {"id": f"{base}{k}", "floor": floor, "x": x, "y": y, "kind": kind, "label": label}
+        nodes[node["id"]] = node
+        graph["nodes"].append(node)
+        if access in nodes and nodes[access]["floor"] == floor:
+            graph["edges"].append({"id": f"E-{access}-{node['id']}", "from": access, "to": node["id"], "distance_m": None})
+
+    if "office_x" in b and not any(n["kind"] == "office" for n in graph["nodes"]):
+        add(f"F{b['office_floor']}-OF", b["office_floor"], b["office_x"], b["office_y"], "office", "관리자실", b.get("office_access_node"))
+    depot = nodes.get(b.get("depot_node") or "")
+    if depot and not any(n["kind"] == "depot" for n in graph["nodes"]):
+        # set just off the corridor point it used to be, so both stay clickable on the map
+        y = depot["y"] + 10 if depot["y"] <= 90 else depot["y"] - 10
+        add(f"F{depot['floor']}-DP", depot["floor"], depot["x"], y, "depot", "분리수거장", depot["id"])
+    b["depot_node"] = ""
+    state["graph_version"] = 2
+    return state
+
+
+def save_workspace(db, user_id: int, state: dict, workspace_id: int | None = None):
+    workspace_id = workspace_id or state.get('_workspace_id') or building_store.selected(db, user_id)
+    building_store.owned(db, user_id, workspace_id)
     state["revision"] = state.get("revision", 0) + 1
     state["updated_at"] = now()
-    db.execute("UPDATE workspaces SET state_json=? WHERE user_id=?",
-               (json.dumps(state, ensure_ascii=False, allow_nan=False), user_id))
+    saved = {k: v for k, v in state.items() if k != '_workspace_id'}
+    db.execute("UPDATE buildings SET state_json=? WHERE id=? AND user_id=? AND deleted_at IS NULL",
+               (json.dumps(saved, ensure_ascii=False, allow_nan=False), workspace_id, user_id))
+    state['_workspace_id'] = workspace_id
 
 
-def bin_status(bin: dict, config: dict) -> str:
-    if bin["fill"] is None:
+def bin_status(bin: dict, config: dict, at: datetime | None = None) -> str:
+    fill = max((v for v in current_fills(bin, config, at).values() if v is not None), default=None)
+    if fill is None:
         return "offline"
     if bin.get("awaiting_confirmation"):
         return "pending"
-    if bin["reading_source"] == "actual":
-        measured = parse_time(bin["measured_at"])
-        if datetime.now(timezone.utc) - measured > timedelta(minutes=config["stale_minutes"]):
-            return "offline"
-    if bin["fill"] >= config["critical_threshold"]:
+    if fill >= config["critical_threshold"]:
         return "critical"
-    if bin["fill"] >= config["warning_threshold"]:
+    if fill >= config["warning_threshold"]:
         return "warning"
     return "normal"
 
 
-def route_signature(state: dict) -> str:
-    inputs = {"building": state["building"], "graph": state["graph"],
+def route_signature(state: dict, at: datetime | None = None, completed_ids=()) -> str:
+    at = at or datetime.now(timezone.utc)
+    inputs = {"route_version": 2, "building": state["building"], "graph": state["graph"],
               "bins": [{k: b.get(k) for k in ["id", "floor", "x", "y", "access_node"]} |
-                       {"status": bin_status(b, state["building"])} for b in state["bins"]]}
+                       ({"collected": True} if b['id'] in completed_ids else
+                        {"compartments": current_fills(b, state["building"], at),
+                         "status": bin_status(b, state["building"], at)}) for b in state["bins"]]}
     return hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest()
+
+
+def collection_version(bin: dict, config: dict, at=None) -> str:
+    values = {'compartments': current_fills(bin, config, at),
+              **{k: bin.get(k) for k in ('id', 'reading_source', 'measured_at', 'received_at', 'awaiting_confirmation')},
+              'warning': config['warning_threshold'], 'critical': config['critical_threshold']}
+    return hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
+
+
+def collection_plan_id(plan: dict) -> str:
+    # Existing saved plans get a stable identity without needing a database rewrite on reads.
+    return plan.get('id') or hashlib.sha256((plan['created_at'] + plan['signature']).encode()).hexdigest()[:24]
+
+
+def current_plan_signature(state: dict, at=None) -> str:
+    return route_signature(state, at, (state.get('last_plan') or {}).get('completed_bin_ids', []))
+
+
+def start_collection_plan(state: dict):
+    state['last_plan'] = calculate_plan(state) | {'id': secrets.token_hex(12), 'completed_bin_ids': [], 'completed_workers': []}
+
+
+def public_bin(bin: dict, config: dict, at: datetime | None = None) -> dict:
+    at = at or datetime.now(timezone.utc)
+    result = copy.deepcopy(bin)
+    receipt = result.pop('collection_receipt', {})
+    result.update(collection_version=collection_version(bin, config, at),
+                  collection_completed_at=receipt.get('completed_at'),
+                  collection_done=bool(receipt) and receipt.get('output_version') == collection_version(bin, config, at))
+    values = current_fills(bin, config, at)
+    result.update(last_compartments=dict(bin["compartments"]), compartments=values,
+                  fill=max((v for v in values.values() if v is not None), default=None),
+                  stale_compartments=[c for c in COMPARTMENTS if bin["compartments"][c] is not None and values[c] is None],
+                  partial_reading=bin["reading_source"] == "actual" and any(v is not None for v in values.values())
+                                  and any(v is None for v in values.values()),
+                  status=bin_status(bin, config, at))
+    return result
 
 
 def public_workspace(state: dict, user: dict) -> dict:
     result = copy.deepcopy(state)
-    for bin in result["bins"]:
-        bin["status"] = bin_status(bin, result["building"])
+    result['workspace_id'] = result.pop('_workspace_id', None)
+    at = datetime.now(timezone.utc)
+    result["bins"] = [public_bin(bin, state["building"], at) for bin in state["bins"]]
     if result.get("last_plan"):
-        result["last_plan"]["outdated"] = result["last_plan"]["signature"] != route_signature(state)
-    result["user"] = user
+        result['last_plan']['id'] = collection_plan_id(result['last_plan'])
+        result["last_plan"]["outdated"] = result["last_plan"]["signature"] != current_plan_signature(state, at)
+    result["user"] = {k: user[k] for k in ('id', 'name', 'email')}
     return result
 
 
+def public_result(db, user: dict, state: dict | None = None):
+    metadata = {'buildings': building_store.summaries(db, user['id']),
+                'deleted_buildings': building_store.summaries(db, user['id'], deleted=True)}
+    if state is None:
+        if user.get('building_id') is None:
+            return {'user': {k: user[k] for k in ('id', 'name', 'email')},
+                    'workspace_id': None, 'building': None, **metadata}
+        state = read_workspace(db, user['id'], user['building_id'])
+    return public_workspace(state, user) | metadata
+
+
 def result_for(db, user: dict, state: dict):
-    save_workspace(db, user["id"], state)
-    return public_workspace(state, user)
+    save_workspace(db, user["id"], state, user.get('building_id'))
+    return public_result(db, user, state)
 
 
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+class BuildingName(StrictModel):
+    name: str = Field(min_length=1, max_length=80)
+
+
+class BuildingCreate(BuildingName):
+    template: Literal['empty', 'basic', 'inha', 'large', 'library', 'civic', 'round'] = 'empty'
+    floors: int = Field(default=1, ge=1, le=10)
+    basement_floors: int = Field(default=0, ge=0, le=5)
+
+
+def building_template(template: str, floors=1) -> dict:
+    if template == 'inha':
+        from tools.build_inha_campus import build_workspaces, campus_data
+        state = build_workspaces(campus_data())[0]
+    elif template == 'empty':
+        state = new_workspace()
+        state['building'].update(floors=floors, office_access_node='', office_x=10, office_y=78)
+        state['graph'] = {'nodes': [
+            {'id': 'F1-N0', 'floor': 1, 'x': 50, 'y': 50, 'kind': 'corridor', 'label': '연결 통로'},
+            {'id': 'F1-OF1', 'floor': 1, 'x': 10, 'y': 78, 'kind': 'office', 'label': '위치 지정 전 관리자실'},
+            {'id': 'F1-DP1', 'floor': 1, 'x': 90, 'y': 78, 'kind': 'depot', 'label': '위치 지정 전 집하장'},
+        ], 'edges': []}
+        real = next(b for b in state['bins'] if b['device_type'] == 'real')
+        real.update(name='위치 지정 전 실물 장치', x=50, y=30, access_node='F1-N0')
+        state['bins'] = [real]
+    else:
+        state = {'large': large_workspace, 'library': library_workspace, 'civic': civic_workspace,
+                 'round': round_workspace}.get(template, new_workspace)()
+    state['map_images'] = sample_floorplans(template)
+    return state
+
+
+@app.get('/api/buildings')
+def get_buildings(user=Depends(current_user)):
+    with database() as db:
+        return {'items': building_store.summaries(db, user['id']),
+                'deleted_items': building_store.summaries(db, user['id'], deleted=True),
+                'active_id': user['building_id']}
+
+
+@app.post('/api/buildings', status_code=201)
+def add_building(body: BuildingCreate, user=Depends(current_user)):
+    name = body.name.strip()
+    if not name:
+        raise HTTPException(422, '건물 이름을 입력해 주세요.')
+    with LOCK, database() as db:
+        building_store.require_room(db, user['id'])
+        state = building_template(body.template, body.floors)
+        state['building']['basement_floors'] = body.basement_floors if body.template == 'empty' else 0
+        state['building']['name'] = name
+        user['building_id'] = building_store.create(db, user['id'], state, now())
+        return public_result(db, user)
+
+
+@app.post('/api/buildings/{building_id}/select')
+def select_building(building_id: int, user=Depends(current_user)):
+    with LOCK, database() as db:
+        building_store.choose(db, user['id'], building_id)
+        user['building_id'] = building_id
+        return public_result(db, user)
+
+
+@app.patch('/api/buildings/{building_id}')
+def rename_building(building_id: int, body: BuildingName, user=Depends(current_user)):
+    name = body.name.strip()
+    if not name:
+        raise HTTPException(422, '건물 이름을 입력해 주세요.')
+    with LOCK, database() as db:
+        state = read_workspace(db, user['id'], building_id)
+        state['building']['name'] = name
+        save_workspace(db, user['id'], state, building_id)
+        return public_result(db, user)
+
+
+@app.delete('/api/buildings/{building_id}')
+def delete_building(building_id: int, user=Depends(current_user)):
+    with LOCK, database() as db:
+        state = read_workspace(db, user['id'], building_id)
+        state['device_key_hint'] = None
+        save_workspace(db, user['id'], state, building_id)
+        db.execute('UPDATE buildings SET deleted_at=?,device_key_hash=NULL WHERE id=? AND user_id=?',
+                   (now(), building_id, user['id']))
+        if user['building_id'] == building_id:
+            user['building_id'] = building_store.selected(db, user['id'])
+        building_store.choose(db, user['id'], user['building_id'])
+        return public_result(db, user)
+
+
+@app.post('/api/buildings/{building_id}/restore')
+def restore_building(building_id: int, user=Depends(current_user)):
+    with LOCK, database() as db:
+        building_store.owned(db, user['id'], building_id, deleted=True)
+        building_store.require_room(db, user['id'])
+        db.execute('UPDATE buildings SET deleted_at=NULL WHERE id=? AND user_id=?', (building_id, user['id']))
+        building_store.choose(db, user['id'], building_id)
+        user['building_id'] = building_id
+        return public_result(db, user)
 
 
 class Login(StrictModel):
@@ -257,8 +793,9 @@ def login(body: Login, response: Response):
         row = db.execute("SELECT * FROM users WHERE email=?", (body.email.strip().lower(),)).fetchone()
         if not row or not hmac.compare_digest(password_hash(body.password, row["salt"]), row["password_hash"]):
             raise HTTPException(401, "이메일 또는 비밀번호를 확인해 주세요.")
-        set_session(response, db, row["id"])
-        return {"id": row["id"], "email": row["email"], "name": row["name"]}
+        user = account_store.primary_user(db, row['id'])
+        set_session(response, db, user['id'])
+        return user
 
 
 @app.post("/api/auth/register", status_code=201)
@@ -275,8 +812,7 @@ def register(body: Register, response: Response):
         cursor = db.execute("INSERT INTO users(email,name,salt,password_hash,created_at) VALUES(?,?,?,?,?)",
                             (email, name, salt, password_hash(body.password, salt), now()))
         user = {"id": cursor.lastrowid, "email": email, "name": name}
-        db.execute("INSERT INTO workspaces(user_id,state_json) VALUES(?,?)",
-                   (user["id"], json.dumps(new_workspace(), ensure_ascii=False)))
+        building_store.create(db, user['id'], new_workspace(), now())
         set_session(response, db, user["id"])
         return user
 
@@ -293,22 +829,36 @@ def logout(request: Request, response: Response):
 @app.get("/api/workspace")
 def get_workspace(user=Depends(current_user)):
     with database() as db:
-        return public_workspace(read_workspace(db, user["id"]), user)
+        return public_result(db, user)
 
 
 class ConfigPatch(StrictModel):
     name: Optional[str] = Field(default=None, min_length=1, max_length=80)
     floors: Optional[int] = Field(default=None, ge=1, le=10)
+    basement_floors: Optional[int] = Field(default=None, ge=0, le=5)
+    layout_note: Optional[str] = Field(default=None, max_length=600)
     total_staff: Optional[int] = Field(default=None, ge=1, le=12)
     available_staff: Optional[int] = Field(default=None, ge=0, le=12)
     include_orange: Optional[bool] = None
-    office_floor: Optional[int] = Field(default=None, ge=1, le=10)
+    route_mode: Optional[RouteMode] = None
+    stairs_up_seconds: Optional[float] = Field(default=None, ge=1, le=300, allow_inf_nan=False)
+    stairs_down_seconds: Optional[float] = Field(default=None, ge=1, le=300, allow_inf_nan=False)
+    elevator_wait_seconds: Optional[float] = Field(default=None, ge=0, le=600, allow_inf_nan=False)
+    elevator_floor_seconds: Optional[float] = Field(default=None, ge=0.5, le=120, allow_inf_nan=False)
+    use_cart: Optional[bool] = None
+    cart_capacity: Optional[float] = Field(default=None, ge=0, le=50, allow_inf_nan=False)
+    depot_node: Optional[str] = Field(default=None, max_length=50)  # version 1, read to upgrade old backups
+    unload_seconds: Optional[int] = Field(default=None, ge=0, le=600)
+    max_work_minutes: Optional[int] = Field(default=None, ge=0, le=480)
+    # version 1 office fields: kept so older backups restore, offices are graph points now
+    office_floor: Optional[FloorNumber] = None
     office_x: Optional[float] = Field(default=None, ge=0, le=100, allow_inf_nan=False)
     office_y: Optional[float] = Field(default=None, ge=0, le=100, allow_inf_nan=False)
     office_access_node: Optional[str] = Field(default=None, max_length=50)
-    meters_per_unit: Optional[float] = Field(default=None, ge=0.05, le=10, allow_inf_nan=False)
+    meters_per_unit: Optional[float] = Field(default=None, ge=0.05, le=20, allow_inf_nan=False)
     speed_mps: Optional[float] = Field(default=None, ge=0.2, le=3, allow_inf_nan=False)
     service_seconds: Optional[int] = Field(default=None, ge=0, le=600)
+    compartment_seconds: Optional[int] = Field(default=None, ge=0, le=600)
     warning_threshold: Optional[int] = Field(default=None, ge=1, le=99)
     critical_threshold: Optional[int] = Field(default=None, ge=2, le=100)
     stale_minutes: Optional[int] = Field(default=None, ge=1, le=120)
@@ -320,19 +870,20 @@ def validate_config(state: dict):
         raise HTTPException(422, "수거 가능 인원은 전체 관리자 수를 넘을 수 없습니다.")
     if cfg["warning_threshold"] >= cfg["critical_threshold"]:
         raise HTTPException(422, "주의 기준은 수거 필요 기준보다 작아야 합니다.")
-    if cfg["office_floor"] > cfg["floors"] or any(b["floor"] > cfg["floors"] for b in state["bins"]):
-        raise HTTPException(422, "등록된 쓰레기통과 관리자실의 층을 먼저 변경해 주세요.")
-    if any(n["floor"] > cfg["floors"] for n in state["graph"]["nodes"]):
-        raise HTTPException(422, "해당 층의 통로를 먼저 삭제해 주세요.")
-    node = next((n for n in state["graph"]["nodes"] if n["id"] == cfg["office_access_node"]), None)
-    if node and node["floor"] != cfg["office_floor"]:
-        raise HTTPException(422, "관리자실과 연결 통로는 같은 층이어야 합니다.")
+    if any(not has_floor(cfg, b["floor"]) for b in state["bins"]):
+        raise HTTPException(422, "등록된 쓰레기통의 층을 먼저 변경해 주세요.")
+    if any(not has_floor(cfg, n["floor"]) for n in state["graph"]["nodes"]):
+        raise HTTPException(422, "해당 층의 지점을 먼저 삭제해 주세요.")
+    if any(not has_floor(cfg, int(floor)) for floor in state.get('map_images', {})):
+        raise HTTPException(422, '해당 층의 도면을 먼저 삭제해 주세요.')
+    if 0 < cfg["cart_capacity"] < 1:
+        raise HTTPException(422, "한 번에 옮길 양은 0(제한 없음) 또는 가득 찬 통 1개 이상이어야 합니다.")
 
 
 @app.patch("/api/config")
 def update_config(body: ConfigPatch, user=Depends(current_user)):
     with LOCK, database() as db:
-        state = read_workspace(db, user["id"])
+        state = read_workspace(db, user["id"], user["building_id"])
         patch = body.model_dump(exclude_unset=True)
         if any(v is None for v in patch.values()):
             raise HTTPException(422, "설정값은 비워 둘 수 없습니다.")
@@ -343,23 +894,21 @@ def update_config(body: ConfigPatch, user=Depends(current_user)):
 
 class BinCreate(StrictModel):
     name: str = Field(min_length=1, max_length=40)
-    floor: int = Field(ge=1, le=10)
+    floor: FloorNumber
     x: float = Field(ge=0, le=100, allow_inf_nan=False)
     y: float = Field(ge=0, le=100, allow_inf_nan=False)
     access_node: str = Field(max_length=50)
-    category: str = Field(default="혼합", min_length=1, max_length=20)
     device_type: Literal["demo", "real"] = "demo"
-    fill: Optional[float] = Field(default=0, ge=0, le=100, allow_inf_nan=False)
+    fills: dict[Compartment, Percent] = Field(default_factory=dict)  # demo values; missing ones start empty
 
 
 class BinPatch(StrictModel):
     name: Optional[str] = Field(default=None, min_length=1, max_length=40)
-    floor: Optional[int] = Field(default=None, ge=1, le=10)
+    floor: Optional[FloorNumber] = None
     x: Optional[float] = Field(default=None, ge=0, le=100, allow_inf_nan=False)
     y: Optional[float] = Field(default=None, ge=0, le=100, allow_inf_nan=False)
     access_node: Optional[str] = Field(default=None, max_length=50)
-    category: Optional[str] = Field(default=None, min_length=1, max_length=20)
-    fill: Optional[float] = Field(default=None, ge=0, le=100, allow_inf_nan=False)
+    fills: Optional[dict[Compartment, Percent]] = None  # demo values of some compartments
 
 
 def find_bin(state: dict, bin_id: str) -> dict:
@@ -370,7 +919,10 @@ def find_bin(state: dict, bin_id: str) -> dict:
 
 
 def validate_bin(state: dict, bin: dict):
-    if bin["floor"] > state["building"]["floors"]:
+    bin['name'] = bin['name'].strip()
+    if not bin['name']:
+        raise HTTPException(422, '쓰레기통 이름을 입력해 주세요.')
+    if not has_floor(state["building"], bin["floor"]):
         raise HTTPException(422, "건물에 없는 층입니다.")
     node = next((n for n in state["graph"]["nodes"] if n["id"] == bin["access_node"]), None)
     if not node or node["floor"] != bin["floor"]:
@@ -380,7 +932,7 @@ def validate_bin(state: dict, bin: dict):
 @app.post("/api/bins", status_code=201)
 def create_bin(body: BinCreate, user=Depends(current_user)):
     with LOCK, database() as db:
-        state = read_workspace(db, user["id"])
+        state = read_workspace(db, user["id"], user["building_id"])
         if len(state["bins"]) >= 100:
             raise HTTPException(422, "MVP에서는 쓰레기통을 최대 100개 등록할 수 있습니다.")
         if body.device_type == "real" and any(b["device_type"] == "real" for b in state["bins"]):
@@ -391,8 +943,10 @@ def create_bin(body: BinCreate, user=Depends(current_user)):
             number += 1
         bin = body.model_dump() | {"id": f"B-{number:03}", "reading_source": "demo", "measured_at": now(),
                                    "received_at": now(), "awaiting_confirmation": False}
+        set_fills(bin, dict.fromkeys(COMPARTMENTS, 0.0) | bin.pop("fills"))
         if body.device_type == "real":
-            bin.update(fill=None, reading_source="unconnected", measured_at=None, received_at=None)
+            set_fills(bin, dict.fromkeys(COMPARTMENTS))
+            bin.update(reading_source="unconnected", measured_at=None, received_at=None)
         validate_bin(state, bin)
         state["bins"].append(bin)
         return result_for(db, user, state)
@@ -401,15 +955,17 @@ def create_bin(body: BinCreate, user=Depends(current_user)):
 @app.patch("/api/bins/{bin_id}")
 def update_bin(bin_id: str, body: BinPatch, user=Depends(current_user)):
     with LOCK, database() as db:
-        state = read_workspace(db, user["id"])
+        state = read_workspace(db, user["id"], user["building_id"])
         bin = find_bin(state, bin_id)
         patch = body.model_dump(exclude_unset=True)
         if any(v is None for v in patch.values()):
             raise HTTPException(422, "쓰레기통 정보는 비워 둘 수 없습니다.")
-        if "fill" in patch and bin["device_type"] == "real":
+        if "fills" in patch and bin["device_type"] == "real":
             raise HTTPException(422, "실물 장치는 센서 수신 또는 실물 시뮬레이션을 사용해 주세요.")
+        fills = patch.pop("fills", None)
         bin.update(patch)
-        if "fill" in patch:
+        if fills is not None:
+            set_fills(bin, fills)
             bin.update(measured_at=now(), received_at=now(), awaiting_confirmation=False)
         validate_bin(state, bin)
         return result_for(db, user, state)
@@ -418,7 +974,7 @@ def update_bin(bin_id: str, body: BinPatch, user=Depends(current_user)):
 @app.delete("/api/bins/{bin_id}")
 def delete_bin(bin_id: str, user=Depends(current_user)):
     with LOCK, database() as db:
-        state = read_workspace(db, user["id"])
+        state = read_workspace(db, user["id"], user["building_id"])
         bin = find_bin(state, bin_id)
         if bin["device_type"] == "real":
             raise HTTPException(422, "실물 시연 장치는 유지해 주세요.")
@@ -428,11 +984,12 @@ def delete_bin(bin_id: str, user=Depends(current_user)):
 
 class GraphNode(StrictModel):
     id: str = Field(min_length=1, max_length=50, pattern=r"^[A-Za-z0-9_-]+$")
-    floor: int = Field(ge=1, le=10)
+    floor: FloorNumber
     x: float = Field(ge=0, le=100, allow_inf_nan=False)
     y: float = Field(ge=0, le=100, allow_inf_nan=False)
-    kind: Literal["corridor", "stairs", "elevator"] = "corridor"
+    kind: Literal["corridor", "stairs", "elevator", "office", "depot"] = "corridor"
     label: str = Field(default="통로", max_length=40)
+    closed: bool = False  # a stair or lift stop out of service: no floor-to-floor moves there
 
 
 class GraphEdge(StrictModel):
@@ -443,23 +1000,23 @@ class GraphEdge(StrictModel):
 
 
 class Graph(StrictModel):
-    nodes: list[GraphNode] = Field(max_length=200)
-    edges: list[GraphEdge] = Field(max_length=600)
+    nodes: list[GraphNode] = Field(max_length=400)
+    edges: list[GraphEdge] = Field(max_length=1200)
 
 
-def validate_graph(graph: dict, floors: int):
+def validate_graph(graph: dict, floors: int, basement_floors: int = 0):
     nodes = {n["id"]: n for n in graph["nodes"]}
     if len(nodes) != len(graph["nodes"]):
-        raise HTTPException(422, "통로 지점 번호가 중복됩니다.")
-    if any(key == "OFFICE" or key.startswith("B-") for key in nodes):
-        raise HTTPException(422, "통로 번호는 쓰레기통 또는 관리자실 번호와 달라야 합니다.")
-    if any(n["floor"] > floors for n in nodes.values()):
-        raise HTTPException(422, "건물에 없는 층의 통로입니다.")
+        raise HTTPException(422, "지점 번호가 중복됩니다.")
+    if any(key.startswith("B-") for key in nodes):
+        raise HTTPException(422, "지점 번호는 쓰레기통 번호와 달라야 합니다.")
+    if any(not has_floor({"floors": floors, "basement_floors": basement_floors}, n["floor"]) for n in nodes.values()):
+        raise HTTPException(422, "건물에 없는 층의 지점입니다.")
     ids, pairs = set(), set()
     for edge in graph["edges"]:
         a, b = nodes.get(edge["from"]), nodes.get(edge["to"])
         if not a or not b or a["id"] == b["id"]:
-            raise HTTPException(422, "연결할 통로 지점을 확인해 주세요.")
+            raise HTTPException(422, "연결할 지점을 확인해 주세요.")
         pair = tuple(sorted([a["id"], b["id"]]))
         if edge["id"] in ids or pair in pairs:
             raise HTTPException(422, "통로 연결이 중복됩니다.")
@@ -472,9 +1029,9 @@ def validate_graph(graph: dict, floors: int):
 @app.put("/api/graph")
 def update_graph(body: Graph, user=Depends(current_user)):
     with LOCK, database() as db:
-        state = read_workspace(db, user["id"])
+        state = read_workspace(db, user["id"], user["building_id"])
         graph = body.model_dump(by_alias=True)
-        validate_graph(graph, state["building"]["floors"])
+        validate_graph(graph, state["building"]["floors"], state["building"].get("basement_floors", 0))
         state["graph"] = graph
         return result_for(db, user, state)
 
@@ -493,18 +1050,16 @@ def build_graph(state: dict):
         if edge.get("distance_m") is not None:
             distance = edge["distance_m"]
         elif a["floor"] == b["floor"]:
-            distance = math.hypot(a["x"] - b["x"], a["y"] - b["y"]) * config["meters_per_unit"]
+            distance = map_distance(a, b, config["meters_per_unit"])
         else:
-            distance = abs(a["floor"] - b["floor"]) * 12.0
+            distance = abs(floor_level(a["floor"]) - floor_level(b["floor"])) * 12.0
         connect(a["id"], b["id"], max(distance, 0.01))
-    points = [{"id": "OFFICE", "floor": config["office_floor"], "x": config["office_x"],
-               "y": config["office_y"], "access_node": config["office_access_node"], "kind": "office"}] + state["bins"]
-    for point in points:
+    for point in state["bins"]:
         nodes[point["id"]] = dict(point)
         adjacency[point["id"]] = []
         access = nodes.get(point["access_node"])
         if access and access["floor"] == point["floor"]:
-            distance = math.hypot(point["x"] - access["x"], point["y"] - access["y"]) * config["meters_per_unit"]
+            distance = map_distance(point, access, config["meters_per_unit"])
             connect(point["id"], access["id"], max(distance, 0.01))
     return nodes, adjacency
 
@@ -524,145 +1079,525 @@ def dijkstra(adjacency: dict, start: str):
     return distances, previous
 
 
+def travel_graph(state: dict):
+    """Directed travel times between points, in seconds, with the walking metres of each step.
+
+    Corridors cost metres / walking speed. Stairs cost a time per floor that differs going up and
+    down. A lift ride costs one boarding wait plus a time per floor: every lift node gets a twin car
+    node, so walking past the lift door costs nothing and the wait is paid once per ride. With a
+    cart the stairs are closed and walking is slower."""
+    config = state["building"]
+    nodes, adjacency = build_graph(state)
+    cart = config["use_cart"]
+    speed = config["speed_mps"] * (CART_SPEED_RATIO if cart else 1)
+    arcs = {key: [] for key in nodes}
+    for key, node in list(nodes.items()):
+        if node.get("kind") == "elevator":
+            nodes[key + CAR] = dict(node, id=key + CAR)
+            arcs[key + CAR] = [(key, 0.0, 0.0)]
+            arcs[key].append((key + CAR, config["elevator_wait_seconds"], 0.0))
+    for a, links in adjacency.items():
+        for b, metres in links:
+            here, there = nodes[a], nodes[b]
+            rise = floor_level(there["floor"]) - floor_level(here["floor"])
+            if not rise:
+                arcs[a].append((b, metres / speed, metres))
+            elif here.get("closed") or there.get("closed"):
+                continue
+            elif here.get("kind") == "elevator":
+                arcs[a + CAR].append((b + CAR, abs(rise) * config["elevator_floor_seconds"], 0.0))
+            elif not cart:
+                seconds = rise * config["stairs_up_seconds"] if rise > 0 else -rise * config["stairs_down_seconds"]
+                arcs[a].append((b, seconds, metres))
+    return nodes, arcs
+
+
+def fastest_paths(arcs: dict, start: str):
+    seconds, metres, previous = {start: 0.0}, {start: 0.0}, {}
+    queue = [(0.0, start)]
+    while queue:
+        elapsed, node = heapq.heappop(queue)
+        if elapsed > seconds[node]:
+            continue
+        for target, cost, length in arcs[node]:
+            value = elapsed + cost
+            if value < seconds.get(target, math.inf) - 1e-9:
+                seconds[target], metres[target], previous[target] = value, metres[node] + length, node
+                heapq.heappush(queue, (value, target))
+    return seconds, metres, previous
+
+
 def calculate_plan(state: dict) -> dict:
     config = state["building"]
-    selected = [b for b in state["bins"] if bin_status(b, config) == "critical" or
-                (config["include_orange"] and bin_status(b, config) == "warning")]
-    nodes, adjacency = build_graph(state)
-    distances, predecessors = {}, {}
-    for source in ["OFFICE"] + [b["id"] for b in selected]:
-        distances[source], predecessors[source] = dijkstra(adjacency, source)
-    unreachable = [b["id"] for b in selected if b["id"] not in distances["OFFICE"]]
+    at = datetime.now(timezone.utc)
+    selected = [b for b in state["bins"] if bin_status(b, config, at) == "critical" or
+                (config["include_orange"] and bin_status(b, config, at) == "warning")]
+    nodes, arcs = travel_graph(state)
+    points = state["graph"]["nodes"]
+    offices = [n["id"] for n in points if n["kind"] == "office"]
+    depots = [n["id"] for n in points if n["kind"] == "depot"]
+    ends = depots or offices  # without a drop-off point the cart is emptied at an office
+    label = {n["id"]: n["label"] for n in points}
+    seconds, metres, previous = {}, {}, {}
+    for source in dict.fromkeys(offices + ends + [b["id"] for b in selected]):
+        seconds[source], metres[source], previous[source] = fastest_paths(arcs, source)
+
+    def start_of(target):  # (seconds, office) of the office this stop is quickest to reach from
+        options = [(seconds[o][target], o) for o in offices if target in seconds[o]]
+        return min(options) if options else None
+
+    unreachable = [b["id"] for b in selected if start_of(b["id"]) is None or not any(e in seconds[b["id"]] for e in ends)]
     targets = [b["id"] for b in selected if b["id"] not in unreachable]
+    issues = []
+    if not offices:
+        issues.append("관리자실이 없습니다. 건물·배치도의 '지점 설정'에서 관리자실을 놓아 주세요.")
+    lonely = [label[o] for o in offices if not arcs.get(o)]
+    if lonely:
+        issues.append(f"통로와 이어지지 않은 관리자실이 있습니다: {', '.join(lonely)}. '통로 연결' 도구로 이어 주세요.")
+    cut_off = [label[d] for d in depots if not any(d in seconds[o] for o in offices)]
+    if offices and cut_off:
+        issues.append(f"관리자실에서 갈 수 없는 분리수거장이 있습니다: {', '.join(cut_off)}. '통로 연결' 도구로 이어 주세요.")
+    if unreachable:
+        issues.append(f"통로와 이어지지 않아 경로에서 빠진 쓰레기통이 있습니다: {', '.join(unreachable)}. 건물·배치도에서 통로 연결을 확인해 주세요.")
+    empty = {b["id"]: to_empty(b, config, at) for b in selected}
+    load = {t: sum(v.values()) / 100 for t, v in empty.items()}  # in full compartments
     workers = min(config["available_staff"], len(targets))
-    assignments: list[list[str]] = [[] for _ in range(workers)]
-    speed, service = config["speed_mps"], config["service_seconds"]
+    mode = config.get("route_mode", ROUTE_DEFAULTS["route_mode"])
+    capacity = config["cart_capacity"] or math.inf
+    limit = config["max_work_minutes"] * 60 or math.inf
+    unload = config["unload_seconds"]
+    capacity_issues = [{"bin_id": t, "load": round(load[t], 3), "capacity": capacity}
+                       for t in targets if load[t] > capacity + 1e-9]
+    if capacity_issues:
+        # The MVP collects a location in one visit. Do not produce an impossible route or silently
+        # omit an oversized location. Leave the whole plan unassigned until the settings/data change.
+        issues += [f"{p['bin_id']}: 수거량 {p['load']:g}칸 분량 / 운반 가능 {p['capacity']:g}칸 분량. "
+                   "한 위치를 나눠 운반하는 기능은 아직 지원하지 않습니다. 실제 운반 용량과 수거 상태를 확인해 주세요."
+                   for p in capacity_issues]
+        return {"created_at": now(), "signature": route_signature(state, at), "include_orange": config["include_orange"],
+                "available_staff": config["available_staff"], "mode": mode, "end": "DEPOT" if depots else "OFFICE",
+                "issues": issues, "blocked_reason": "capacity", "capacity_issues": capacity_issues,
+                "max_work_seconds": None if limit == math.inf else limit, "routes": [], "target_ids": targets,
+                "unreachable": unreachable, "empty": {t: empty[t] for t in targets}, "unassigned": targets,
+                "total_distance_m": 0.0, "makespan_seconds": 0, "total_seconds": 0,
+                "method": "time-model-alns", "outdated": False}
+    # time at a location: a base time plus a time per compartment emptied
+    serve = {t: config["service_seconds"] + config["compartment_seconds"] * len(v) for t, v in empty.items()}
+    cache: dict[tuple, tuple] = {}
+    # Same inputs, same plan: the search is seeded from everything but the chosen preset and the
+    # number of available staff (the worker count of each search is part of its own seed).
+    seed = route_signature(dict(state, building={k: v for k, v in config.items() if k not in ("route_mode", "available_staff")}), at)
 
-    def length(route):
-        if not route:
-            return 0.0
-        sequence = ["OFFICE"] + route + ["OFFICE"]
-        return sum(distances[a][b] for a, b in zip(sequence, sequence[1:]))
+    def evaluate(route):
+        # Seconds, walking metres, trips and start office for one visiting order. The route starts
+        # at the office nearest its first stop. The cart is emptied whenever the next bins would not
+        # fit, at whichever drop-off point (or office) suits; dynamic programming picks where to
+        # break the order into trips and where each trip unloads.
+        key = tuple(route)
+        if key in cache:
+            return cache[key]
+        n = len(route)
+        if not n:
+            cache[key] = (0.0, 0.0, [], None)
+            return cache[key]
+        chain_t, chain_m, served = [0.0], [0.0], [0.0]
+        for t in route:
+            served.append(served[-1] + serve[t])
+        for a, b in zip(route, route[1:]):
+            chain_t.append(chain_t[-1] + seconds[a].get(b, math.inf))
+            chain_m.append(chain_m[-1] + metres[a].get(b, 0.0))
+        first = start_of(route[0])
+        # best[j][e]: (seconds, metres, i, previous end) covering route[:j] with the last trip ending at e
+        best: list[dict] = [{} for _ in range(n + 1)]
+        for j in range(1, n + 1):
+            carried = 0.0
+            for i in range(j - 1, -1, -1):
+                carried += load[route[i]]
+                if carried > capacity + 1e-9:
+                    break
+                inner_t = chain_t[j - 1] - chain_t[i] + served[j] - served[i] + unload
+                inner_m = chain_m[j - 1] - chain_m[i]
+                if i == 0:
+                    leads = [(0.0, 0.0, None, first[0], metres[first[1]][route[0]])] if first else []
+                else:
+                    leads = [(t, m, e, seconds[e].get(route[i], math.inf), metres[e].get(route[i], 0.0))
+                             for e, (t, m, *_) in best[i].items()]
+                for prev_t, prev_m, prev_end, lead_t, lead_m in leads:
+                    for e in ends:
+                        tail = seconds[route[j - 1]].get(e)
+                        if tail is None:
+                            continue
+                        value = prev_t + lead_t + inner_t + tail
+                        if value < best[j].get(e, (math.inf,))[0]:
+                            best[j][e] = (value, prev_m + lead_m + inner_m + metres[route[j - 1]][e], i, prev_end)
+        if not best[n] or not first:
+            cache[key] = (math.inf, 0.0, [], None)
+            return cache[key]
+        e = min(best[n], key=lambda k: (best[n][k][0], k))
+        total_t, total_m = best[n][e][:2]
+        trips, j = [], n
+        while j > 0:
+            _, _, i, prev_end = best[j][e]
+            trips.append((j, e))
+            j, e = i, prev_end
+        cache[key] = result = (total_t, total_m, sorted(trips), first[1])
+        return result
 
-    def elapsed(route):
-        return length(route) / speed + service * len(route)
+    def value_of(span, total, used, preset):
+        # fastest: finish time, then total time; the cap needs no term, because the earliest finish
+        # keeps everyone under it whenever that is possible. lean: the worst overrun of the cap first,
+        # then the number of workers, then finish time, then total time.
+        if preset == "fastest":
+            return span + 0.001 * total
+        return 1e7 * max(0.0, span - limit) + 1e5 * used + span + 0.001 * total
 
-    # Farthest-first insertion balances projected finishing time, including the return to the office.
-    for target in sorted(targets, key=lambda t: (-distances["OFFICE"][t], t)) if workers else []:
-        options = []
-        for worker, route in enumerate(assignments):
-            for position in range(len(route) + 1):
-                candidate = route[:position] + [target] + route[position:]
-                times = [elapsed(candidate) if i == worker else elapsed(r) for i, r in enumerate(assignments)]
-                options.append((max(times), sum(times), worker, position))
-        _, _, worker, position = min(options)
-        assignments[worker].insert(position, target)
+    def score(routes, preset):
+        times = [evaluate(r)[0] for r in routes if r]
+        return value_of(max(times, default=0.0), sum(times), len(times), preset)
 
-    # Route reversal (2-opt), followed by bounded cross-worker relocation.
-    def improve(route):
-        for _ in range(12):
-            best, best_length = route, length(route)
+    def options(routes, target, preset):
+        # Every place the target could go, cheapest first. Only the first empty route is tried.
+        times = [evaluate(r)[0] for r in routes]
+        total, used = sum(times), sum(1 for r in routes if r)
+        found, tried_empty = [], False
+        for r, route in enumerate(routes):
+            if not route:
+                if tried_empty:
+                    continue
+                tried_empty = True
+            other_span = max(times[:r] + times[r + 1:], default=0.0)
+            for p in range(len(route) + 1):
+                new = evaluate(route[:p] + [target] + route[p:])[0]
+                value = value_of(max(other_span, new), total - times[r] + new, used + (0 if route else 1), preset)
+                found.append((value, r, p))
+        found.sort()
+        return found
+
+    def repair(routes, removed, preset, regret):
+        # Greedy: put each stop in its cheapest place. Regret-2: first place the stop that would lose
+        # the most if its best place were taken.
+        routes, left = [r[:] for r in routes], list(removed)
+        while left:
+            if regret:
+                choice = None
+                for t in left:
+                    found = options(routes, t, preset)
+                    gap = found[1][0] - found[0][0] if len(found) > 1 else math.inf
+                    if choice is None or gap > choice[0]:
+                        choice = (gap, t, found[0])
+                _, t, (_, r, p) = choice
+            else:
+                t = left[0]
+                _, r, p = options(routes, t, preset)[0]
+            routes[r].insert(p, t)
+            left.remove(t)
+        return routes
+
+    def destroy(routes, how, rng):
+        stops = [t for r in routes for t in r]
+        count = min(len(stops), rng.randint(1, max(1, min(5, len(stops) // 3 + 1))))
+        if how == "random":
+            removed = rng.sample(stops, count)
+        elif how == "worst":
+            savings = sorted(((evaluate(r)[0] - evaluate(r[:i] + r[i + 1:])[0], t) for r in routes for i, t in enumerate(r)), reverse=True)
+            removed = [t for _, t in savings[:count]]
+        elif how == "related":
+            seed = rng.choice(stops)
+            removed = sorted(stops, key=lambda t: (seconds[seed].get(t, math.inf) + seconds[t].get(seed, math.inf), t))[:count]
+        else:
+            removed = list(rng.choice([r for r in routes if r]))
+        gone = set(removed)
+        return [[t for t in r if t not in gone] for r in routes], removed
+
+    def polish(route):
+        # Reverse a section (2-opt) or move one stop, judged by the full route time with unloading.
+        for _ in range(20):
+            best, best_time = route, evaluate(route)[0]
             for i in range(len(route)):
                 for j in range(i + 2, len(route) + 1):
-                    candidate = route[:i] + list(reversed(route[i:j])) + route[j:]
-                    candidate_length = length(candidate)
-                    if candidate_length + 0.001 < best_length:
-                        best, best_length = candidate, candidate_length
+                    trial = route[:i] + list(reversed(route[i:j])) + route[j:]
+                    if evaluate(trial)[0] + 0.001 < best_time:
+                        best, best_time = trial, evaluate(trial)[0]
+                rest = route[:i] + route[i + 1:]
+                for p in range(len(rest) + 1):
+                    trial = rest[:p] + [route[i]] + rest[p:]
+                    if evaluate(trial)[0] + 0.001 < best_time:
+                        best, best_time = trial, evaluate(trial)[0]
             if best is route:
-                break
+                return route
             route = best
         return route
 
-    assignments = [improve(r) for r in assignments]
-    for _ in range(10):
-        old_score = (max((elapsed(r) for r in assignments), default=0), sum(elapsed(r) for r in assignments))
-        best_score, best_assignment = old_score, None
-        for i, route in enumerate(assignments):
-            if len(route) < 2:
-                continue
-            for target in route:
-                for j, other in enumerate(assignments):
-                    if i == j:
-                        continue
-                    for position in range(len(other) + 1):
-                        candidate = [r[:] for r in assignments]
-                        candidate[i].remove(target)
-                        candidate[j].insert(position, target)
-                        score = (max(elapsed(r) for r in candidate), sum(elapsed(r) for r in candidate))
-                        if score < best_score:
-                            best_score, best_assignment = score, candidate
-        if best_assignment is None:
-            break
-        assignments = [improve(r) for r in best_assignment]
+    def search(preset, count):
+        # Several independent runs with different random seeds, as long as the time budget allows;
+        # the best plan for at most `count` workers wins. The first run always completes.
+        if not count:
+            return []
+        began, best = time.perf_counter(), None
+        for attempt in range(SEARCH_RESTARTS):
+            if attempt and time.perf_counter() - began > SEARCH_SECONDS / 2:
+                break
+            found = settle(anneal(preset, count, random.Random(f"{seed}-{preset}-{count}-{attempt}"), began), preset, began)
+            if best is None or score(found, preset) < score(best, preset) - 1e-6:
+                best = found
+        return best
+
+    def anneal(preset, count, rng, began):
+        # Adaptive large neighbourhood search: repeatedly remove a few stops and put them back,
+        # accept by simulated annealing, and use more often the removal rules that pay off.
+        start_routes = repair([[] for _ in range(count)], sorted(targets, key=lambda t: (-start_of(t)[0], t)), preset, False)
+        current = best = start_routes
+        current_score = best_score = score(best, preset)
+        times = [evaluate(r)[0] for r in best if r]
+        heat = max(0.5, SEARCH_HEAT * max(times))  # both presets now trade mainly in finish time
+        rules, weights = ["random", "worst", "related", "route"], [1.0] * 4
+        gained, used = [0.0] * 4, [0] * 4
+        rounds = SEARCH_ROUNDS + SEARCH_ROUNDS_PER_STOP * len(targets) if len(targets) > 1 else 0
+        for step in range(rounds):
+            if time.perf_counter() - began > SEARCH_SECONDS:
+                break
+            k = rng.choices(range(4), weights)[0]
+            partial, removed = destroy(current, rules[k], rng)
+            candidate = repair(partial, removed, preset, regret=len(targets) <= 15 and rng.random() < 0.3)
+            value = score(candidate, preset)
+            temperature = heat * 0.001 ** (step / rounds)
+            used[k] += 1
+            if value < best_score - 1e-6:
+                best, best_score, current, current_score = candidate, value, candidate, value
+                gained[k] += 3
+            elif value < current_score - 1e-6:
+                current, current_score = candidate, value
+                gained[k] += 2
+            elif value - current_score < 30 * temperature and rng.random() < math.exp(-(value - current_score) / temperature):
+                current, current_score = candidate, value
+                gained[k] += 1
+            if (step + 1) % 50 == 0:
+                weights = [max(0.1, 0.7 * w + 0.3 * (g / u if u else 0)) for w, g, u in zip(weights, gained, used)]
+                gained, used = [0.0] * 4, [0] * 4
+        return best
+
+    def settle(routes, preset, began):
+        # Finish with plain local search between workers: move one stop to another worker or swap two
+        # stops, taking the first change that helps, until none does or the time budget runs out.
+        routes = [polish(r) for r in routes]
+        improved = True
+        while improved and time.perf_counter() - began < SEARCH_SECONDS * 1.5:
+            improved = False
+            current = score(routes, preset)
+            times = [evaluate(r)[0] for r in routes]
+            for i, a in enumerate(routes):
+                for x, stop in enumerate(a):
+                    rest = a[:x] + a[x + 1:]
+                    for j, b in enumerate(routes):
+                        if i == j or (not b and any(not r for r in routes[:j])):
+                            continue
+                        others = [t for k, t in enumerate(times) if k not in (i, j)]
+                        trials = [(rest, b[:p] + [stop] + b[p:]) for p in range(len(b) + 1)]
+                        if i < j:
+                            trials += [(rest[:x] + [y] + rest[x:], b[:q] + [stop] + b[q + 1:]) for q, y in enumerate(b)]
+                        for new_a, new_b in trials:
+                            ta, tb = evaluate(new_a)[0], evaluate(new_b)[0]
+                            moved = [t for t in (ta, tb) if t] + [t for t in others if t]
+                            if value_of(max(moved, default=0.0), sum(moved), len(moved), preset) < current - 1e-6:
+                                routes[i], routes[j] = polish(new_a), polish(new_b)
+                                improved = True
+                                break
+                        if improved:
+                            break
+                    if improved:
+                        break
+                if improved:
+                    break
+        return routes
 
     def path(a, b):
-        route = [b]
-        while route[-1] != a:
-            route.append(predecessors[a][route[-1]])
-        return list(reversed(route))
+        steps = [b]
+        while steps[-1] != a:
+            steps.append(previous[a][steps[-1]])
+        out: list[str] = []
+        for step in reversed(steps):
+            step = step.removesuffix(CAR)
+            if not out or out[-1] != step:
+                out.append(step)
+        return out
 
-    routes = []
-    for index, route in enumerate(assignments):
-        if not route:
+    def summary(assigned):
+        used = [r for r in assigned if r]
+        used = [r for r in used if evaluate(r)[0] < math.inf]
+        times = [evaluate(r)[0] for r in used]
+        return {"workers": len(used), "total_distance_m": round(sum(round(evaluate(r)[1], 1) for r in used), 1),
+                "makespan_seconds": max((round(t) for t in times), default=0), "total_seconds": round(sum(times))}
+
+    fastest = search("fastest", workers)
+    # 인력 아끼기: first the fewest workers that keep everyone under the cap, then the fastest plan for
+    # exactly that many. The second search is the same as '빨리 끝내기' with that many staff, so spare
+    # staff never change the result.
+    fewest = search("lean", workers)
+    needed = sum(1 for r in fewest if r)
+    lean = fastest if needed == workers else search("fastest", needed)
+    if score(fewest, "lean") < score(lean, "lean") - 1e-6 and max((evaluate(r)[0] for r in lean if r), default=0.0) > limit:
+        lean = fewest  # the second search missed the cap that the first one kept
+    # '빨리 끝내기' never ends later than '인력 아끼기': it takes the lean plan if that one is faster.
+    plans = {"fastest": min((fastest, lean), key=lambda routes: score(routes, "fastest")), "lean": lean}
+    if mode not in plans:
+        mode = ROUTE_DEFAULTS["route_mode"]
+    routes, split = [], []
+    for route in (r for r in plans[mode] if r):
+        duration, walked, trips, start = evaluate(route)
+        if duration == math.inf:  # parts with no corridor between them and too few workers to cover each
+            split += route
             continue
-        sequence = ["OFFICE"] + route + ["OFFICE"]
-        path_ids: list[str] = []
-        for a, b in zip(sequence, sequence[1:]):
+        sequence, previous_cut = [], 0
+        for cut, end_point in trips:
+            sequence += route[previous_cut:cut] + [end_point]
+            previous_cut = cut
+        stops, path_ids = [start] + sequence, []
+        for a, b in zip(stops, stops[1:]):
             leg = path(a, b)
             path_ids.extend(leg if not path_ids else leg[1:])
+        index = len(routes)
         routes.append({"worker": index + 1, "color": ROUTE_COLORS[index % len(ROUTE_COLORS)],
-                       "bin_ids": route, "distance_m": round(length(route), 1),
-                       "duration_seconds": round(elapsed(route)),
+                       "bin_ids": route, "start": start, "sequence": sequence, "drops": len(trips),
+                       "distance_m": round(walked, 1), "duration_seconds": round(duration),
+                       "over_limit": duration > limit + 0.5,
                        "path": [{"id": n, "floor": nodes[n]["floor"], "x": nodes[n]["x"], "y": nodes[n]["y"],
                                  "kind": nodes[n].get("kind", "bin")} for n in path_ids]})
-    return {"created_at": now(), "signature": route_signature(state), "include_orange": config["include_orange"],
-            "available_staff": config["available_staff"], "routes": routes,
-            "target_ids": targets, "unreachable": unreachable,
+    if split:
+        issues.append(f"서로 오갈 수 없는 구역에 있어 경로에 넣지 못한 쓰레기통이 있습니다: {', '.join(split)}. "
+                      "'통로 연결' 도구로 구역을 이어 주세요.")
+        unreachable += split
+        targets = [t for t in targets if t not in split]
+    return {"created_at": now(), "signature": route_signature(state, at), "include_orange": config["include_orange"],
+            "available_staff": config["available_staff"], "mode": mode, "end": "DEPOT" if depots else "OFFICE", "issues": issues,
+            "max_work_seconds": None if limit == math.inf else limit, "routes": routes,
+            "target_ids": targets, "unreachable": unreachable, "empty": {t: empty[t] for t in targets},
             "unassigned": targets if workers == 0 else [],
             "total_distance_m": round(sum(r["distance_m"] for r in routes), 1),
             "makespan_seconds": max((r["duration_seconds"] for r in routes), default=0),
-            "method": "dijkstra-balanced-insertion-2opt", "outdated": False}
+            "total_seconds": sum(r["duration_seconds"] for r in routes),
+            "comparison": {name: summary(assigned) for name, assigned in plans.items()},
+            "method": "time-model-alns", "outdated": False}
 
 
 class PlanRequest(StrictModel):
     available_staff: Optional[int] = Field(default=None, ge=0, le=12)
     include_orange: Optional[bool] = None
+    route_mode: Optional[RouteMode] = None
 
 
 @app.post("/api/plan")
 def plan(body: PlanRequest, user=Depends(current_user)):
     with LOCK, database() as db:
-        state = read_workspace(db, user["id"])
+        state = read_workspace(db, user["id"], user["building_id"])
         state["building"].update({k: v for k, v in body.model_dump(exclude_unset=True).items() if v is not None})
         validate_config(state)
-        state["last_plan"] = calculate_plan(state)
+        start_collection_plan(state)
         return result_for(db, user, state)
 
 
 class CollectRequest(StrictModel):
     worker: Optional[int] = Field(default=None, ge=1, le=12)
+    plan_id: Optional[str] = Field(default=None, min_length=1, max_length=64)
+    version: Optional[str] = Field(default=None, min_length=1, max_length=64)
+
+
+def validate_collection(state: dict, bin: dict, at):
+    current = public_bin(bin, state['building'], at)
+    if current['fill'] is None or bin.get('awaiting_confirmation') or current['fill'] <= 0:
+        raise HTTPException(422, '수거할 상태값이 없거나 이미 비어 있거나 센서 확인을 기다리고 있습니다.')
+    if bin['reading_source'] == 'actual' and current['status'] == 'offline':
+        raise HTTPException(422, '최신 센서값을 수신한 뒤 수거를 완료해 주세요.')
+
+
+def record_collection(state: dict, bin: dict, user: dict, worker, at):
+    stamp = at.isoformat()
+    version = collection_version(bin, state['building'], at)
+    current = public_bin(bin, state['building'], at)
+    emptied = to_empty(bin, state['building'], at)
+    state['logs'].insert(0, {'id': secrets.token_hex(6), 'bin_id': bin['id'], 'floor': bin['floor'],
+                            'name': bin['name'], 'fill_before': current['fill'], 'emptied': emptied,
+                            'worker': worker, 'actor': user['name'], 'source': bin['reading_source'], 'completed_at': stamp})
+    state['logs'] = state['logs'][:1000]
+    if bin['reading_source'] == 'actual':
+        bin.update(awaiting_confirmation=True, collection_pending_at=stamp, pending_compartments=sorted(emptied))
+    else:
+        set_fills(bin, dict.fromkeys(emptied, 0.0))
+        bin.update(measured_at=stamp, received_at=stamp)
+    bin['collection_receipt'] = {'input_version': version, 'output_version': collection_version(bin, state['building'], at),
+                                 'completed_at': stamp}
+
+
+def record_plan_progress(state: dict, ids: list[str], at):
+    plan = state['last_plan']
+    plan['id'] = collection_plan_id(plan)
+    completed = set(plan.get('completed_bin_ids', [])) | (set(ids) & set(plan['target_ids']))
+    plan['completed_bin_ids'] = [bin_id for bin_id in plan['target_ids'] if bin_id in completed]
+    finished = {row['worker']: row for row in plan.get('completed_workers', [])}
+    for route in plan['routes']:
+        if route['bin_ids'] and set(route['bin_ids']).issubset(completed):
+            finished.setdefault(route['worker'], {'worker': route['worker'], 'completed_at': at.isoformat()})
+    plan['completed_workers'] = list(finished.values())
+    # Keep the assignment/order until the user starts another plan. Completed stops' sensor
+    # updates do not invalidate the other workers' outstanding collection assignments.
+    plan['signature'] = current_plan_signature(state, at)
 
 
 @app.post("/api/collect/{bin_id}")
 def collect(bin_id: str, body: CollectRequest, user=Depends(current_user)):
     with LOCK, database() as db:
-        state = read_workspace(db, user["id"])
+        state = read_workspace(db, user["id"], user["building_id"])
         bin = find_bin(state, bin_id)
-        if bin["fill"] is None or bin.get("awaiting_confirmation"):
-            raise HTTPException(422, "수거할 상태값이 없거나 센서 확인을 기다리고 있습니다.")
-        if bin["reading_source"] == "actual" and bin_status(bin, state["building"]) == "offline":
-            raise HTTPException(422, "최신 센서값을 수신한 뒤 수거를 완료해 주세요.")
-        state["logs"].insert(0, {"id": secrets.token_hex(6), "bin_id": bin_id, "floor": bin["floor"],
-                                 "name": bin["name"], "fill_before": bin["fill"], "worker": body.worker,
-                                 "actor": user["name"], "source": bin["reading_source"], "completed_at": now()})
-        state["logs"] = state["logs"][:1000]
-        if bin["reading_source"] == "actual":
-            bin["awaiting_confirmation"] = True
-            bin["collection_pending_at"] = now()
-        else:
-            bin.update(fill=0, measured_at=now(), received_at=now())
-        if state["last_plan"]:
-            state["last_plan"] = calculate_plan(state)
+        at = datetime.now(timezone.utc)
+        plan = state.get('last_plan')
+        assigned = next((r for r in (plan or {}).get('routes', []) if bin_id in r['bin_ids']), None)
+        fresh = plan and plan['signature'] == current_plan_signature(state, at)
+        if body.plan_id and (not plan or body.plan_id != collection_plan_id(plan)):
+            raise HTTPException(409, '수거 경로가 바뀌었습니다. 최신 정보를 불러와 다시 확인해 주세요.')
+        if body.plan_id and bin_id in plan.get('completed_bin_ids', []):
+            return public_result(db, user, state)
+        receipt = bin.get('collection_receipt', {})
+        if (body.version and body.version == receipt.get('input_version')) or public_bin(bin, state['building'], at)['collection_done']:
+            return public_result(db, user, state)
+        if body.version and body.version != collection_version(bin, state['building'], at):
+            raise HTTPException(409, '쓰레기통 상태가 바뀌었습니다. 최신 상태를 확인한 뒤 완료해 주세요.')
+        if body.plan_id and not fresh:
+            raise HTTPException(409, '수거 조건이 바뀌었습니다. 경로를 다시 계산해 주세요.')
+        if body.worker is not None and (body.worker > state['building']['total_staff'] or
+                                        (body.plan_id and assigned and assigned['worker'] != body.worker)):
+            raise HTTPException(422, '이 쓰레기통의 담당 관리자를 확인해 주세요.')
+        validate_collection(state, bin, at)
+        record_collection(state, bin, user, body.worker or (assigned['worker'] if assigned and fresh else None), at)
+        if fresh:
+            record_plan_progress(state, [bin_id], at)
+        return result_for(db, user, state)
+
+
+class WorkerCollectRequest(StrictModel):
+    plan_id: str = Field(min_length=1, max_length=64)
+
+
+@app.post('/api/collect/worker/{worker}')
+def collect_worker(worker: int, body: WorkerCollectRequest, user=Depends(current_user)):
+    with LOCK, database() as db:
+        state = read_workspace(db, user['id'], user['building_id'])
+        plan = state.get('last_plan')
+        if not plan or body.plan_id != collection_plan_id(plan):
+            raise HTTPException(409, '수거 경로가 바뀌었습니다. 최신 정보를 불러와 다시 확인해 주세요.')
+        route = next((r for r in plan['routes'] if r['worker'] == worker), None)
+        if not route:
+            raise HTTPException(422, '이 관리자에게 배정된 수거가 없습니다.')
+        completed = set(plan.get('completed_bin_ids', []))
+        remaining = [find_bin(state, bin_id) for bin_id in route['bin_ids'] if bin_id not in completed]
+        if not remaining:
+            return public_result(db, user, state)
+        at = datetime.now(timezone.utc)
+        if plan['signature'] != current_plan_signature(state, at):
+            raise HTTPException(409, '수거 조건이 바뀌었습니다. 경로를 다시 계산해 주세요.')
+        for bin in remaining:
+            validate_collection(state, bin, at)
+        for bin in remaining:
+            record_collection(state, bin, user, worker, at)
+        record_plan_progress(state, [bin['id'] for bin in remaining], at)
         return result_for(db, user, state)
 
 
@@ -676,45 +1611,51 @@ def scenario(body: Scenario, user=Depends(current_user)):
               "rush": [98, 86, 92, 97, 91, 88, 83, 96, 95, 89, 93],
               "calm": [24, 43, 34, 17, 65, 28, 35, 46, 32, 58, 21]}
     with LOCK, database() as db:
-        state = read_workspace(db, user["id"])
+        state = read_workspace(db, user["id"], user["building_id"])
         index = 0
         for bin in state["bins"]:
             if bin["device_type"] == "demo":
-                bin.update(fill=values[body.scenario][index % 11], measured_at=now(), received_at=now(),
-                           awaiting_confirmation=False)
+                set_fills(bin, demo_fills(values[body.scenario][index % 11], index))
+                bin.update(measured_at=now(), received_at=now(), awaiting_confirmation=False)
                 index += 1
-        if state["last_plan"]:
-            state["last_plan"] = calculate_plan(state)
         return result_for(db, user, state)
 
 
 class Simulation(StrictModel):
-    fill: Optional[float] = Field(default=None, ge=0, le=100, allow_inf_nan=False)
+    fills: Optional[dict[Compartment, Percent]] = None  # None disconnects the simulation
 
 
 @app.post("/api/demo/real-simulation")
 def real_simulation(body: Simulation, user=Depends(current_user)):
     with LOCK, database() as db:
-        state = read_workspace(db, user["id"])
+        state = read_workspace(db, user["id"], user["building_id"])
         bin = next((b for b in state["bins"] if b["device_type"] == "real"), None)
         if not bin:
             raise HTTPException(404, "실물 장치가 없습니다.")
-        if body.fill is None:
-            bin.update(fill=None, reading_source="unconnected", measured_at=None, received_at=None,
-                       awaiting_confirmation=False)
+        if body.fills is None:
+            set_fills(bin, dict.fromkeys(COMPARTMENTS))
+            bin.update(reading_source="unconnected", measured_at=None, received_at=None, awaiting_confirmation=False)
         else:
-            bin.update(fill=body.fill, reading_source="simulated", measured_at=now(), received_at=now(),
-                       awaiting_confirmation=False)
-        state["readings"].insert(0, {"bin_id": bin["id"], "fill": body.fill, "source": bin["reading_source"], "at": now()})
+            set_fills(bin, dict.fromkeys(COMPARTMENTS, 0.0) | body.fills)
+            bin.update(reading_source="simulated", measured_at=now(), received_at=now(), awaiting_confirmation=False)
+        bin["compartment_measured_at"] = {}
+        state["readings"].insert(0, {"bin_id": bin["id"], "fill": bin["fill"], "fills": body.fills,
+                                     "source": bin["reading_source"], "at": now()})
         state["readings"] = state["readings"][:200]
         return result_for(db, user, state)
 
 
+class DemoReset(StrictModel):
+    template: Literal["basic", "large", "library", "civic", "round"] = "basic"
+
+
 @app.post("/api/demo/reset")
-def reset_demo(user=Depends(current_user)):
+def reset_demo(body: DemoReset, user=Depends(current_user)):
     with LOCK, database() as db:
-        old_state = read_workspace(db, user["id"])
-        state = new_workspace()
+        old_state = read_workspace(db, user["id"], user["building_id"])
+        state = {"large": large_workspace, "library": library_workspace, "civic": civic_workspace,
+                 "round": round_workspace}.get(body.template, new_workspace)()
+        state["map_images"] = sample_floorplans(body.template)
         state["device_key_hint"] = old_state.get("device_key_hint")
         return result_for(db, user, state)
 
@@ -723,17 +1664,19 @@ def reset_demo(user=Depends(current_user)):
 def create_device_key(user=Depends(current_user)):
     key = "rl_" + secrets.token_urlsafe(32)
     with LOCK, database() as db:
-        state = read_workspace(db, user["id"])
+        state = read_workspace(db, user["id"], user["building_id"])
         state["device_key_hint"] = key[-6:]
-        db.execute("UPDATE workspaces SET device_key_hash=? WHERE user_id=?",
-                   (hashlib.sha256(key.encode()).hexdigest(), user["id"]))
+        db.execute("UPDATE buildings SET device_key_hash=? WHERE id=? AND user_id=?",
+                   (hashlib.sha256(key.encode()).hexdigest(), user["building_id"], user["id"]))
         save_workspace(db, user["id"], state)
     return {"key": key, "hint": key[-6:]}
 
 
 class DeviceReading(StrictModel):
     bin_id: str = Field(min_length=1, max_length=20)
-    fill_percent: float = Field(ge=0, le=100, allow_inf_nan=False)
+    compartment: Optional[Compartment] = None  # one compartment with fill_percent ...
+    fill_percent: Optional[float] = Field(default=None, ge=0, le=100, allow_inf_nan=False)
+    fills: Optional[dict[Compartment, Percent]] = None  # ... or several compartments at once
     measured_at: Optional[str] = Field(default=None, max_length=50)
 
 
@@ -742,27 +1685,45 @@ def device_reading(body: DeviceReading, x_device_key: str = Header(default="", m
     if not x_device_key:
         raise HTTPException(401, "X-Device-Key 헤더가 필요합니다.")
     with LOCK, database() as db:
-        row = db.execute("SELECT user_id FROM workspaces WHERE device_key_hash=?",
+        row = db.execute("SELECT id,user_id FROM buildings WHERE device_key_hash=? AND deleted_at IS NULL",
                          (hashlib.sha256(x_device_key.encode()).hexdigest(),)).fetchone()
         if not row:
             raise HTTPException(401, "장치 연결 키를 확인해 주세요.")
-        state = read_workspace(db, row["user_id"])
+        state = read_workspace(db, row["user_id"], row["id"])
         bin = find_bin(state, body.bin_id)
         if bin["device_type"] != "real":
             raise HTTPException(422, "실물로 등록된 쓰레기통만 센서값을 수신합니다.")
+        if body.compartment and body.fill_percent is not None and body.fills is None:
+            fills = {body.compartment: body.fill_percent}
+        elif body.fills and body.compartment is None and body.fill_percent is None:
+            fills = body.fills
+        else:
+            raise HTTPException(422, "칸별 적재율을 compartment와 fill_percent, 또는 fills로 보내 주세요.")
         measured = parse_time(body.measured_at) if body.measured_at else datetime.now(timezone.utc)
         if measured > datetime.now(timezone.utc) + timedelta(minutes=2):
             raise HTTPException(422, "측정 시각이 현재보다 너무 늦습니다.")
-        if bin["reading_source"] == "actual" and bin["measured_at"] and measured <= parse_time(bin["measured_at"]):
+        times = bin.get("compartment_measured_at") or {}
+        if bin["reading_source"] == "actual" and any(c in times and measured <= parse_time(times[c]) for c in fills):
             raise HTTPException(409, "이미 수신한 값보다 이전 측정값입니다.")
-        still_pending = bool(bin.get("awaiting_confirmation") and bin.get("collection_pending_at") and
-                             measured <= parse_time(bin["collection_pending_at"]))
-        bin.update(fill=round(body.fill_percent, 1), measured_at=measured.isoformat(), received_at=now(),
-                   reading_source="actual", awaiting_confirmation=still_pending)
-        state["readings"].insert(0, {"bin_id": bin["id"], "fill": bin["fill"], "source": "actual", "at": now()})
+        if bin["reading_source"] != "actual":  # simulated values are not mixed with real ones
+            set_fills(bin, dict.fromkeys(COMPARTMENTS))
+            times = {}
+        pending = set(bin.get("pending_compartments", COMPARTMENTS))
+        if bin.get("collection_pending_at") and measured > parse_time(bin["collection_pending_at"]):
+            pending -= set(fills)
+        still_pending = bool(bin.get("awaiting_confirmation") and pending)
+        set_fills(bin, fills)
+        times.update(dict.fromkeys(fills, measured.isoformat()))
+        latest = max([measured] + ([parse_time(bin["measured_at"])] if bin["reading_source"] == "actual" and bin["measured_at"] else []))
+        bin.update(measured_at=latest.isoformat(), received_at=now(), reading_source="actual", compartment_measured_at=times,
+                   awaiting_confirmation=still_pending, pending_compartments=sorted(pending) if still_pending else [])
+        state["readings"].insert(0, {"bin_id": bin["id"], "fill": bin["fill"], "fills": fills, "source": "actual", "at": now()})
         state["readings"] = state["readings"][:200]
-        save_workspace(db, row["user_id"], state)
-    return {"ok": True, "bin_id": body.bin_id, "fill_percent": bin["fill"], "status": bin_status(bin, state["building"])}
+        save_workspace(db, row["user_id"], state, row["id"])
+    current = public_bin(bin, state["building"])
+    return {"ok": True, "bin_id": body.bin_id, "compartments": current["compartments"], "fill_percent": current["fill"],
+            "stale_compartments": current["stale_compartments"], "partial_reading": current["partial_reading"],
+            "status": current["status"]}
 
 
 class MapImage(StrictModel):
@@ -772,8 +1733,8 @@ class MapImage(StrictModel):
 @app.put("/api/floorplan/{floor}")
 def upload_floorplan(floor: int, body: MapImage, user=Depends(current_user)):
     with LOCK, database() as db:
-        state = read_workspace(db, user["id"])
-        if floor < 1 or floor > state["building"]["floors"]:
+        state = read_workspace(db, user["id"], user["building_id"])
+        if not has_floor(state["building"], floor):
             raise HTTPException(422, "건물에 없는 층입니다.")
         if body.data_url is None:
             state["map_images"].pop(str(floor), None)
@@ -802,7 +1763,7 @@ def upload_floorplan(floor: int, body: MapImage, user=Depends(current_user)):
 @app.get("/api/floorplan/{floor}")
 def get_floorplan(floor: int, user=Depends(current_user)):
     with database() as db:
-        state = read_workspace(db, user["id"])
+        state = read_workspace(db, user["id"], user["building_id"])
         name = state["map_images"].get(str(floor))
         if not name or Path(name).name != name or not (MAP_DIR / name).is_file():
             raise HTTPException(404, "등록한 도면이 없습니다.")
@@ -812,8 +1773,9 @@ def get_floorplan(floor: int, user=Depends(current_user)):
 @app.get("/api/backup")
 def backup(user=Depends(current_user)):
     with database() as db:
-        state = read_workspace(db, user["id"])
+        state = read_workspace(db, user["id"], user["building_id"])
     state.pop("device_key_hint", None)
+    state.pop("_workspace_id", None)
     state["last_plan"] = None
     images = {}
     for floor, name in state.get("map_images", {}).items():
@@ -821,7 +1783,7 @@ def backup(user=Depends(current_user)):
         if file.is_file():
             images[floor] = base64.b64encode(file.read_bytes()).decode()
     return JSONResponse({"format": "reloop-backup-v1", "created_at": now(), "workspace": state, "images": images},
-                        headers={"Content-Disposition": 'attachment; filename="reloop-backup.json"'})
+                        headers={"Content-Disposition": 'attachment; filename="inloop-backup.json"'})
 
 
 class RestoreRequest(StrictModel):
@@ -834,9 +1796,10 @@ class RestoreRequest(StrictModel):
 class SavedLog(StrictModel):
     id: str = Field(min_length=1, max_length=50)
     bin_id: str = Field(min_length=1, max_length=20)
-    floor: int = Field(ge=1, le=10)
+    floor: FloorNumber
     name: str = Field(max_length=40)
     fill_before: float = Field(ge=0, le=100, allow_inf_nan=False)
+    emptied: Optional[dict[Compartment, Percent]] = None
     worker: Optional[int] = Field(default=None, ge=1, le=12)
     actor: str = Field(min_length=1, max_length=40)
     source: Literal["actual", "simulated", "demo"]
@@ -846,6 +1809,7 @@ class SavedLog(StrictModel):
 class SavedReading(StrictModel):
     bin_id: str = Field(max_length=20)
     fill: Optional[float] = Field(default=None, ge=0, le=100, allow_inf_nan=False)
+    fills: Optional[dict[Compartment, Percent]] = None
     source: Literal["actual", "simulated", "demo", "unconnected"]
     at: str = Field(max_length=50)
 
@@ -856,7 +1820,7 @@ def restore(body: RestoreRequest, user=Depends(current_user)):
         raise HTTPException(422, "백업 파일은 35MB 이하로 선택해 주세요.")
     try:
         incoming = body.workspace
-        config = ConfigPatch(**incoming["building"]).model_dump()
+        config = ConfigPatch(**({"basement_floors": 0, "layout_note": ""} | ROUTE_DEFAULTS | incoming["building"])).model_dump()
         if any(v is None for v in config.values()):
             raise ValueError("incomplete configuration")
         graph = Graph(**incoming["graph"]).model_dump(by_alias=True)
@@ -865,21 +1829,24 @@ def restore(body: RestoreRequest, user=Depends(current_user)):
         bins = []
         ids = set()
         for item in incoming["bins"]:
-            clean = BinCreate(**{k: item[k] for k in BinCreate.model_fields}).model_dump()
+            item = upgrade_bins({"bins": [dict(item)]})["bins"][0]  # older backups: one category and one fill
+            known = {c: v for c, v in item["compartments"].items() if v is not None}
+            clean = BinCreate(**{k: item[k] for k in BinCreate.model_fields if k != "fills"}, fills=known).model_dump()
+            fills = clean.pop("fills")
             bin_id = item["id"]
             if not isinstance(bin_id, str) or not bin_id.startswith("B-") or not bin_id[2:].isdigit() or len(bin_id) > 12 or bin_id in ids:
                 raise ValueError("invalid bin id")
             ids.add(bin_id)
             source = "demo" if clean["device_type"] == "demo" else "unconnected"
-            if source == "unconnected":
-                clean["fill"] = None
-            bins.append(clean | {"id": bin_id, "reading_source": source,
-                                 "measured_at": now() if source == "demo" else None,
-                                 "received_at": now() if source == "demo" else None, "awaiting_confirmation": False})
+            bin = clean | {"id": bin_id, "reading_source": source, "measured_at": now() if source == "demo" else None,
+                           "received_at": now() if source == "demo" else None, "awaiting_confirmation": False}
+            bins.append(set_fills(bin, dict.fromkeys(COMPARTMENTS) if source == "unconnected" else dict.fromkeys(COMPARTMENTS, 0.0) | fills))
         if sum(b["device_type"] == "real" for b in bins) != 1:
             raise ValueError("one real device required")
         state = new_workspace()
-        state.update(building=config, graph=graph, bins=bins, map_images={}, logs=[], readings=[], last_plan=None)
+        state.update(building=config, graph=graph, bins=bins, map_images={}, logs=[], readings=[], last_plan=None,
+                     graph_version=2 if incoming.get('graph_version') == 2 or any(n["kind"] == "office" for n in graph["nodes"]) else 1)
+        upgrade_points(state)
         if len(incoming.get("logs", [])) > 1000 or len(incoming.get("readings", [])) > 200:
             raise ValueError("too many records")
         state["logs"] = [SavedLog(**item).model_dump() for item in incoming.get("logs", [])]
@@ -888,15 +1855,15 @@ def restore(body: RestoreRequest, user=Depends(current_user)):
             parse_time(item["completed_at"])
         for item in state["readings"]:
             parse_time(item["at"])
-        validate_graph(graph, config["floors"])
+        validate_graph(graph, config["floors"], config["basement_floors"])
         validate_config(state)
         for bin in bins:
             validate_bin(state, bin)
     except (ValueError, KeyError, TypeError):
-        raise HTTPException(422, "리루프에서 내보낸 백업 파일인지 확인해 주세요.")
+        raise HTTPException(422, "inloop에서 내보낸 백업 파일인지 확인해 주세요.")
     images_to_write = []
     for floor, encoded in body.images.items():
-        if not floor.isdigit() or not 1 <= int(floor) <= config["floors"]:
+        if floor not in {str(f) for f in range(-config['basement_floors'], config['floors'] + 1) if f != 0}:
             raise HTTPException(422, "도면의 층 정보를 확인해 주세요.")
         try:
             raw = base64.b64decode(encoded, validate=True)
@@ -909,7 +1876,7 @@ def restore(body: RestoreRequest, user=Depends(current_user)):
         state["map_images"][floor] = name
         images_to_write.append((name, raw))
     with LOCK, database() as db:
-        old = read_workspace(db, user["id"])
+        old = read_workspace(db, user["id"], user["building_id"])
         state["device_key_hint"] = old.get("device_key_hint")
         for name, raw in images_to_write:
             (MAP_DIR / name).write_bytes(raw)
