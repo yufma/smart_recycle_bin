@@ -23,9 +23,9 @@ npm run build        # 로컬 서버용 dist/
 npm run build:pages  # GitHub Pages용 site-dist/
 ```
 
-GitHub Pages의 배포 원본은 **`gh-pages` 브랜치 루트**입니다. `site-dist/`의 내용만 그 브랜치에 올립니다. 수정 소스는 `codex/inloop-public-demo` 브랜치에 있습니다. `main`의 팀원 작업을 덮어쓰지 않습니다. 공개 사이트를 갱신하려면 변경한 소스로 `build:pages`를 실행한 뒤 결과를 `gh-pages`에 새 커밋으로 올리세요.
+GitHub Pages의 배포 원본은 **`gh-pages` 브랜치 루트**입니다. `site-dist/`의 내용만 그 브랜치에 올립니다. 최신 소스는 **`main`** 브랜치에 병합되어 있습니다. 공개 사이트를 갱신하려면 변경한 소스로 `build:pages`를 실행한 뒤 결과를 `gh-pages`에 새 커밋으로 올리세요.
 
-`tools/build_public_demo.py`는 공개할 소스·지도·가상 초기 데이터만 골라 `public/public-demo/backend.zip`과 검증용 manifest를 만듭니다. **로컬 SQLite·계정·센서 키·실제 수거 기록은 포함하지 않습니다.** 도서관 사진 6장은 이 공개 체험용 묶음에 포함됩니다. 이후 빌드는 기존 묶음의 사진을 재사용하므로 원본 사진 폴더가 없어도 됩니다. 사진을 교체할 때만 `python -m tools.build_public_demo --photos "도면 사진 폴더"`를 사용합니다. 지도 출처는 `public/public-demo/ATTRIBUTION.txt`에 있습니다.
+`tools/build_public_demo.py`는 공개할 소스·지도·가상 초기 데이터만 골라 `public/public-demo/backend.zip`과 검증용 manifest를 만듭니다. **로컬 SQLite·계정·센서 키·실제 수거 기록은 포함하지 않습니다.** 도서관 사진 6장은 `assets/jeongseok-floorplans/`의 B1·1F~5F 원본을 사용합니다. 기존 압축 파일이나 개인 사진 폴더 없이 새 체크아웃에서도 빌드할 수 있습니다. `backend.zip`·`manifest.json`은 자동 생성 결과로 Git에서 제외하며 공개 사이트 배포 결과에는 포함합니다. 별도의 원본 폴더를 사용하려면 `python -m tools.build_public_demo --photos "도면 사진 폴더"`를 사용합니다. 지도 출처는 `public/public-demo/ATTRIBUTION.txt`에 있습니다.
 
 ## 수거 완료 · 날짜별 기록 · inloop — 2026-11-09
 

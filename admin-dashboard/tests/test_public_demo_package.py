@@ -6,12 +6,23 @@ import json
 from pathlib import Path
 import zipfile
 
+import pytest
+
+from tools.build_public_demo import FLOORPLANS, package
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_public_archive_is_allowlisted_and_has_three_fictional_workspaces():
-    folder = ROOT / 'public/public-demo'
+@pytest.fixture(scope='module')
+def built_demo(tmp_path_factory):
+    folder = tmp_path_factory.mktemp('public-demo')
+    package(output=folder)
+    return folder
+
+
+def test_public_archive_is_allowlisted_and_has_three_fictional_workspaces(built_demo):
+    folder = built_demo
     manifest = json.loads((folder / 'manifest.json').read_text(encoding='utf-8'))
     archive = folder / manifest['archive']
     assert hashlib.sha256(archive.read_bytes()).hexdigest() == manifest['sha256']
@@ -31,6 +42,9 @@ def test_public_archive_is_allowlisted_and_has_three_fictional_workspaces():
                 assert 'demo-assets/' + filename in names
         library = seeds[2]
         assert sorted(map(int, library['map_images'])) == [-1, 1, 2, 3, 4, 5]
+        for floor, filename in library['map_images'].items():
+            original = ('B1' if floor == '-1' else f'{floor}F') + '.jpg'
+            assert packed.read('demo-assets/' + filename) == (FLOORPLANS / original).read_bytes()
         for state in seeds[1:]:
             assert '시연용 가정' in state['building']['layout_note']
 

@@ -4,9 +4,9 @@
     pip install torch torchvision pillow numpy
 
 사용 예:
-    python predict.py --model beta-2b.pt 사진.jpg
-    python predict.py --model beta-2b.pt 사진폴더 --csv 결과.csv
-    python predict.py --model beta-2a.pt 원본.jpg --box 812,430,1260,1105
+    python predict.py --model models/beta-2b.pt 사진.jpg
+    python predict.py --model models/beta-2b.pt 사진폴더 --csv 결과.csv
+    python predict.py --model models/beta-2a.pt 원본.jpg --box 812,430,1260,1105
 
 입력 사진은 기기와 같은 구도(물체 1개가 가운데, 물체 상자가 화면의 35-45 %)여야 학습 때와 같은 조건이 됩니다.
 --box x0,y0,x1,y1 (원본 픽셀 좌표의 물체 상자)를 주면 학습 평가 때와 똑같은 40 % 구도(eval40)로 잘라서 분류합니다.

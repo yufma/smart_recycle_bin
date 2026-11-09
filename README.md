@@ -1,21 +1,31 @@
 # Smart Recycle Bin
 
-스마트 분리수거함 프로젝트의 프론트엔드와 백엔드를 함께 관리하는 저장소입니다.
+스마트 분리수거함과 관리자 웹 앱 **inloop**를 함께 관리하는 저장소입니다.
 
 ## 폴더 구성
 
 ```text
 smart_recycle_bin/
-├── frontend/        # 사용자 화면과 프론트엔드 코드
-├── backend/         # 서버, AI 모델 및 관련 자료
-└── admin-dashboard/ # 대회 시연용 관리자 앱 (React + FastAPI + SQLite)
+├── admin-dashboard/      # inloop 관리자 앱
+│   ├── src/              # React 화면
+│   ├── server/           # 로컬 API · SQLite · 동선 알고리즘
+│   ├── browser/          # 공개 체험용 브라우저 실행 환경
+│   ├── assets/           # 공개 체험 도면 사진 원본
+│   ├── datasets/         # 인하대 공개 지도 자료
+│   ├── tests/            # 자동 검사
+│   ├── tools/            # 도면·체험 묶음 생성과 장치 연결 도구
+│   └── android/          # Android WebView 앱
+└── backend/              # AI 분류
+    ├── models/           # 모델 가중치 · ESP32-S3 양자화 모델
+    ├── predict.py        # 사진 분류 실행
+    └── README.md         # 모델 사용법 · 학습·검증 기록
 ```
 
 ## 관리자 대시보드 MVP
 
 **[inloop 공개 체험](https://yufma.github.io/smart_recycle_bin/)** · 설치 없이 **시연 계정으로 둘러보기**로 시작할 수 있습니다. 방문자마다 자기 브라우저에 독립된 더미 데이터가 저장됩니다.
 
-[`admin-dashboard/`](admin-dashboard/)에 로컬 서버와 GitHub Pages에서 실행하는 관리자 앱 **inloop**가 있습니다. 최신 소스는 `codex/inloop-public-demo`, 공개 화면은 `gh-pages` 브랜치에 있습니다.
+[`admin-dashboard/`](admin-dashboard/)에 로컬 서버와 GitHub Pages에서 실행하는 관리자 앱 **inloop**가 있습니다. 최신 소스는 **`main`**, 공개 화면은 **`gh-pages`** 브랜치에 있습니다.
 
 - 기본 3층 건물과 여러 시연 건물의 쓰레기통 번호, 칸별 적재율과 초록·주황·빨강 상태
 - 관리자실에서 출발해 분리수거장에서 종료하는 경로와 ‘빨리 끝내기 / 인력 아끼기’ 배분
@@ -35,10 +45,10 @@ Windows에 Python 3.10 이상과 Node.js 20.19 이상을 설치한 뒤 `admin-da
 
 ## 개발 시작
 
-1. 프론트엔드 코드는 `frontend/`에 추가합니다.
-2. 백엔드 코드는 `backend/`에 추가합니다.
-3. 사용하는 언어와 프레임워크를 정한 뒤 각 폴더의 README에 설치·실행 방법을 기록합니다.
-4. API 경로, 요청·응답 형식, 개발 서버 주소를 정해 두 작업을 연결합니다.
+- 관리자 화면은 `admin-dashboard/src/`, API·동선 계산은 `admin-dashboard/server/`에서 수정합니다.
+- AI 모델과 사진 분류는 `backend/`에서 관리합니다. [모델 실행 방법](backend/README.md)을 참고하세요.
+- 도서관 사진은 `admin-dashboard/assets/jeongseok-floorplans/`, 캠퍼스 자료는 `admin-dashboard/datasets/`에 있습니다.
+- `dist/`, `site-dist/`, 공개 체험용 `backend.zip`·`manifest.json`은 소스에서 다시 만드는 결과물이며 Git에 넣지 않습니다. [빌드·배포 방법](admin-dashboard/README.md#공개-체험--github-pages)을 참고하세요.
 
 ## 환경 설정
 
@@ -46,11 +56,14 @@ Windows에 Python 3.10 이상과 Node.js 20.19 이상을 설치한 뒤 `admin-da
 
 ## 변경사항 올리기
 
-저장소 폴더에서 변경한 파일을 확인한 뒤 커밋하고 업로드합니다.
+최신 `main`에서 작업 브랜치를 만들고 변경한 파일만 커밋합니다. 검사 후 `main`에 병합하며, 웹 공개 결과물은 `gh-pages`에 올립니다.
 
 ```sh
+git switch main
+git pull --ff-only origin main
+git switch -c codex/작업-이름
 git status
-git add frontend backend README.md .gitignore .gitattributes
-git commit -m "Describe the change"
-git push origin main
+# 변경한 파일을 선택해 git add 후 커밋합니다.
+git commit -m "변경 내용 설명"
+git push -u origin HEAD
 ```

@@ -13,6 +13,7 @@ from tools.build_jeongseok_library import PHOTOS, build_workspace
 
 ROOT = Path(__file__).resolve().parent.parent
 OUTPUT = ROOT / 'public' / 'public-demo'
+FLOORPLANS = ROOT / 'assets' / 'jeongseok-floorplans'
 
 
 def populate_demo(state):
@@ -71,13 +72,9 @@ def seed_workspaces():
     return [dummy, campus, library]
 
 
-def package(photos=None):
-    OUTPUT.mkdir(parents=True, exist_ok=True)
-    archive = OUTPUT / 'backend.zip'
-    retained = {}
-    if archive.exists():
-        with zipfile.ZipFile(archive) as previous:
-            retained = {name: previous.read(name) for name in previous.namelist() if name.startswith('demo-assets/seed-jeongseok-')}
+def package(photos=None, output=OUTPUT):
+    output.mkdir(parents=True, exist_ok=True)
+    archive = output / 'backend.zip'
     files = {}
     for path in (ROOT / 'server').glob('*.py'):
         files[path.relative_to(ROOT).as_posix()] = path.read_bytes()
@@ -91,10 +88,9 @@ def package(photos=None):
         name = f'demo-assets/seed-jeongseok-{floor}.jpg'
         if photos:
             files[name] = (photos / filename).read_bytes()
-        elif name in retained:
-            files[name] = retained[name]
         else:
-            raise ValueError('최초 빌드에는 --photos 폴더가 필요합니다.')
+            filename = ('B1' if floor == -1 else f'{floor}F') + '.jpg'
+            files[name] = (FLOORPLANS / filename).read_bytes()
     files['demo-assets/seeds.json'] = json.dumps(seed_workspaces(), ensure_ascii=False, allow_nan=False).encode()
     files['browser_runtime.py'] = (ROOT / 'browser/runtime.py').read_bytes()
     # Allow-list above deliberately excludes local accounts, SQLite files, logs, keys and settings.
@@ -106,8 +102,8 @@ def package(photos=None):
     manifest = {'format': 'inloop-public-demo-v1', 'archive': 'backend.zip',
                 'sha256': hashlib.sha256(archive.read_bytes()).hexdigest(), 'files': len(files),
                 'pyodide': '314.0.7', 'data': 'synthetic collection sites; no local database or credentials'}
-    (OUTPUT / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
-    (OUTPUT / 'ATTRIBUTION.txt').write_text(
+    (output / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+    (output / 'ATTRIBUTION.txt').write_text(
         'Campus map: © OpenStreetMap contributors, ODbL 1.0. https://www.openstreetmap.org/copyright\n'
         'Jeongseok floor plans: photographs provided by the project owner for this competition demo.\n'
         'Bin positions, fill levels and operational sites are fictional demo data.\n', encoding='utf-8')

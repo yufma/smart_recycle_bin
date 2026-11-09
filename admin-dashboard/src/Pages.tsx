@@ -1,7 +1,7 @@
 import { floorLabel, floorsOf } from './floors';
 import { useEffect, useRef, useState } from 'react';
 import type { ChangeEvent, FormEvent } from 'react';
-import { AlertCircle, ArrowUpRight, Building2, Check, Clock3, Copy, Download, FileImage, Footprints, Home, KeyRound, Link2, Loader2, MapPin, MousePointer2, Plus, Radio, Recycle, RefreshCw, Save, Search, Settings2, ShieldCheck, Sparkles, Trash2, Upload, Users, X } from 'lucide-react';
+import { AlertCircle, Building2, Check, Copy, Download, FileImage, Home, KeyRound, Link2, MapPin, MousePointer2, Plus, Radio, Recycle, RefreshCw, Save, Search, ShieldCheck, Sparkles, Trash2, Upload, Users, X } from 'lucide-react';
 import type { PageProps } from './App';
 import type { Bin, Compartment, Graph, GraphNode } from './types';
 import { api, compartmentName, compartments, dateTime, duration, fillText, payload, sourceText } from './types';

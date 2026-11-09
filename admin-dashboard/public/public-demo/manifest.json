@@ -1,8 +1,0 @@
-{
-  "format": "inloop-public-demo-v1",
-  "archive": "backend.zip",
-  "sha256": "32f28d41c7b7fa724c3c735a222c6c781415d9f20a1e4376b90cf8bded715b9f",
-  "files": 41,
-  "pyodide": "314.0.7",
-  "data": "synthetic collection sites; no local database or credentials"
-}

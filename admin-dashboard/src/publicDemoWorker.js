@@ -66,7 +66,6 @@ async function persist() {
 
 const boot = async () => {
   status('체험 공간을 준비하고 있습니다. 처음 접속할 때는 잠시 걸릴 수 있어요.');
-  const root = new URL('../public-demo/', self.location.href);
   // Vite passes the deployment base and source-bundle version explicitly at initialization.
   const manifest = await (await fetch(self.__init.manifest)).json();
   const archive = await (await fetch(new URL(manifest.archive + '?v=' + manifest.sha256, self.__init.manifest))).arrayBuffer();
