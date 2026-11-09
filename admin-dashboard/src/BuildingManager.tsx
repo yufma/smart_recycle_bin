@@ -33,7 +33,7 @@ export default function BuildingManager({ s, busy, error, action, onClose, onSel
     {view !== 'list' && <button className="text-link building-back" disabled={busy} onClick={() => setView('list')}><ArrowLeft aria-hidden="true" size={15} />건물 목록</button>}
     {error && <p className="form-error" role="alert">{error}</p>}
     {view === 'list' ? <>
-      <p className="building-account-note"><strong>로그인 계정</strong><span>{s.user.email}</span><small>다른 브라우저에서도 같은 계정으로 로그인하면 같은 건물을 볼 수 있습니다.</small></p>
+      <p className="building-account-note"><strong>로그인 계정</strong><span>{s.user.email}</span><small>{window.inloopPublicDemo ? '체험 계정과 건물은 이 브라우저에만 저장됩니다.' : '다른 브라우저에서도 같은 계정으로 로그인하면 같은 건물을 볼 수 있습니다.'}</small></p>
       <div className="building-manager-list">{s.buildings.map(item => <div className={`building-manager-row ${item.id === s.workspace_id ? 'current' : ''}`} key={item.id}>
         <button className="building-choice" disabled={busy} aria-current={item.id === s.workspace_id ? 'true' : undefined}
           onClick={async () => { if (item.id === s.workspace_id) { onClose(); return; } if (await action(`/buildings/${item.id}/select`, {}, 'POST', `${item.name}으로 전환했습니다.`)) onSelected(); }}>

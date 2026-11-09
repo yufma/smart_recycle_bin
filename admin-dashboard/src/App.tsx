@@ -98,7 +98,7 @@ export default function App() {
   const load = useCallback(async () => {
     const captured = ++epoch.current;
     try { const next = await api<WorkspaceResponse>('/workspace'); if (captured !== epoch.current) return; setS(next); setOffline(false); setStartError(''); setActionError(''); }
-    catch (e) { if (captured !== epoch.current) return; if ((e as { status: number }).status === 401) setS(null); else setStartError('로컬 서버에 연결할 수 없습니다. 서버 실행 상태를 확인해 주세요.'); }
+    catch (e) { if (captured !== epoch.current) return; if ((e as { status: number }).status === 401) setS(null); else setStartError(window.inloopPublicDemo ? '체험 공간을 불러오지 못했습니다. 인터넷 연결과 브라우저 저장 공간을 확인한 뒤 다시 연결해 주세요.' : '로컬 서버에 연결할 수 없습니다. 서버 실행 상태를 확인해 주세요.'); }
     finally { setLoading(false); }
   }, []);
   useEffect(() => { load(); const handler = () => setPage(initialPage()); window.addEventListener('hashchange', handler); return () => window.removeEventListener('hashchange', handler); }, [load]);
