@@ -1,6 +1,6 @@
 {
   "app": "inloop",
-  "source_commit": "32f87931c217c20b36d936991aaba54799bdd8de",
-  "source_branch": "codex/inloop-public-demo",
+  "source_commit": "483d9231f9aea812ce47bb61b1b484b85cba6881",
+  "source_branch": "main",
   "storage": "independent browser data"
 }
