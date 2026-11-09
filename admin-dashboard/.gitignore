@@ -24,3 +24,5 @@ android/build/
 android/app/build/
 android/dist/
 android/local.properties
+
+site-dist/

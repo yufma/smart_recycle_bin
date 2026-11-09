@@ -1,0 +1,3 @@
+Campus map: © OpenStreetMap contributors, ODbL 1.0. https://www.openstreetmap.org/copyright
+Jeongseok floor plans: photographs provided by the project owner for this competition demo.
+Bin positions, fill levels and operational sites are fictional demo data.

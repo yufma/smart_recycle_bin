@@ -1,3 +1,4 @@
+import { floorLabel } from './floors';
 import type { Bin, Building, Graph, GraphNode } from './types';
 
 export type CoreKind = 'stairs' | 'elevator';
@@ -91,7 +92,7 @@ export function placeStop(graph: Graph, shaft: Shaft, floor: number, x: number, 
   const here = shaft.nodes.get(floor);
   if (here) return { ...graph, nodes: graph.nodes.map(n => n.id === here.id ? { ...n, x, y } : n) };
   const id = `F${floor}-${shaft.code}`;
-  if (graph.nodes.some(n => n.id === id)) return `${floor}층에 이미 ${shaft.code} 번호를 쓰는 지점이 있습니다.`;
+  if (graph.nodes.some(n => n.id === id)) return `${floorLabel(floor)}에 이미 ${shaft.code} 번호를 쓰는 지점이 있습니다.`;
   const node: GraphNode = { id, floor, x, y, kind: shaft.kind, label: shaft.name };
   return relink([...graph.nodes, node], graph.edges, new Set([...memberIds(shaft), id]), saved?.edges);
 }
@@ -147,22 +148,22 @@ export function linkCheck(graph: Graph, building: Building, bins: Bin[]) {
   const floorsReached = new Set([...reached].filter(id => next.get(id)!.length).map(id => byId.get(id)!.floor));
   const problems: LinkProblem[] = [];
   if (!offices.length) problems.push({ text: "관리자실이 없습니다. '지점 설정'에서 관리자실을 놓아 주세요.", bins: [] });
-  offices.filter(o => !next.get(o.id)!.length).forEach(o => problems.push({ text: `${o.floor}층 ${josa(o.label, '이', '가')} 통로와 이어져 있지 않습니다.`, bins: [] }));
+  offices.filter(o => !next.get(o.id)!.length).forEach(o => problems.push({ text: `${floorLabel(o.floor)} ${josa(o.label, '이', '가')} 통로와 이어져 있지 않습니다.`, bins: [] }));
   const cart = building.use_cart ? ' 카트를 쓰면 계단으로는 층을 옮길 수 없습니다.' : '';
   const lost = offices.length ? bins.filter(b => !reached.has(b.access_node)) : [];
   const byFloor = new Map<number, Bin[]>();
   lost.forEach(b => byFloor.set(b.floor, [...(byFloor.get(b.floor) ?? []), b]));
   [...byFloor.entries()].sort((a, b) => a[0] - b[0]).forEach(([floor, group]) => {
     if (!floorsReached.has(floor)) {
-      problems.push({ text: `${floor}층이 관리자실과 이어져 있지 않습니다.${cart}`, bins: group.map(b => b.id) });
+      problems.push({ text: `${floorLabel(floor)}이 관리자실과 이어져 있지 않습니다.${cart}`, bins: group.map(b => b.id) });
       return;
     }
     group.forEach(b => {
       const node = byId.get(b.access_node);
-      problems.push({ text: node ? `${b.floor}층 ${b.id}의 연결 통로(${node.label})가 이 층 복도와 이어져 있지 않습니다.` : `${b.id}의 연결 통로가 없습니다.`, bins: [b.id] });
+      problems.push({ text: node ? `${floorLabel(b.floor)} ${b.id}의 연결 통로(${node.label})가 이 층 복도와 이어져 있지 않습니다.` : `${b.id}의 연결 통로가 없습니다.`, bins: [b.id] });
     });
   });
-  if (offices.length) depots.filter(d => !reached.has(d.id)).forEach(d => problems.push({ text: `${d.floor}층 ${josa(d.label, '이', '가')} 관리자실과 이어져 있지 않습니다.${cart}`, bins: [] }));
+  if (offices.length) depots.filter(d => !reached.has(d.id)).forEach(d => problems.push({ text: `${floorLabel(d.floor)} ${josa(d.label, '이', '가')} 관리자실과 이어져 있지 않습니다.${cart}`, bins: [] }));
   const loose = graph.nodes.filter(n => !next.get(n.id)!.length && n.kind !== 'office');
   return { problems, loose, binCount: bins.length, depots: depots.length };
 }

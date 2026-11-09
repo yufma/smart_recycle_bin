@@ -4,6 +4,7 @@ import type { PointerEvent as ReactPointerEvent } from 'react';
 import type { GraphNode, Route, Workspace } from './types';
 import { fillText, statusColor, statusText } from './types';
 import { kindName, shortCode } from './graphTools';
+import { floorLabel } from './floors';
 
 interface Props {
   workspace: Workspace; floor: number; routes?: Route[]; selectedBin?: string;
@@ -135,7 +136,7 @@ export default function MapView({ workspace: s, floor, routes = [], selectedBin,
   // markers keep their screen size on a zoomed map: each is shrunk back around its own position
   const keep = (x: number, y: number) => zoomed ? `translate(${x} ${y}) scale(${k}) translate(${-x} ${-y})` : undefined;
   return <div className="map-frame"><div className={`building-map ${editing ? 'editable' : ''} ${zoomed ? 'zoomed' : ''}`}>
-    <svg ref={svg} viewBox={`${left} ${top} ${1000 / view.scale} ${560 / view.scale}`} preserveAspectRatio="xMidYMid meet" role="group" aria-label={`${floor}층 쓰레기통 및 관리자실 배치도`}
+    <svg ref={svg} viewBox={`${left} ${top} ${1000 / view.scale} ${560 / view.scale}`} preserveAspectRatio="xMidYMid meet" role="group" aria-label={`${floorLabel(floor)} 쓰레기통 및 관리자실 배치도`}
       onClick={e => { if (!moveRef.current) { const p = point(e); onPlace?.(p.x, p.y); } moveRef.current = false; }}
       onPointerDown={e => { if (zoomed && !drag && e.button === 0) pan.current = { x: e.clientX, y: e.clientY, cx: view.cx, cy: view.cy, on: false, id: e.pointerId }; }}
       onPointerMove={e => {
@@ -155,7 +156,7 @@ export default function MapView({ workspace: s, floor, routes = [], selectedBin,
       </defs>
       <rect width="1000" height="560" fill="#f7f9f6" />
       <rect width="1000" height="560" fill="url(#map-grid)" />
-      {floorImage ? <image href={`/api/floorplan/${floor}?building_id=${s.workspace_id}&v=${floorImage}`} x="50" y="45" width="900" height="460" preserveAspectRatio="xMidYMid meet" opacity="0.72" /> : <g className="blueprint">
+      {floorImage ? <image href={s.map_image_urls?.[String(floor)] || `/api/floorplan/${floor}?building_id=${s.workspace_id}&v=${floorImage}`} x="50" y="45" width="900" height="460" preserveAspectRatio="xMidYMid meet" opacity="0.72" /> : <g className="blueprint">
         <rect x="50" y="45" width="900" height="460" rx="5" fill="#fcfdfb" stroke="#ced8d0" strokeWidth="3" />
         <rect x="52" y="225" width="896" height="100" fill="#edf1eb" />
         {[50, 280, 510, 740].map((x, i) => <g key={x}>
@@ -192,8 +193,9 @@ export default function MapView({ workspace: s, floor, routes = [], selectedBin,
           onClick={e => { e.stopPropagation(); if (!moveRef.current) onNodeClick?.(n.id); }}
           onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onNodeClick?.(n.id); } }}
           onPointerDown={e => startDrag(e, 'node', n.id, n.x, n.y)}>
-          <circle cx={px(p.x)} cy={py(p.y)} r="10" fill={selectedNodes.includes(n.id) ? '#244b3d' : n.closed ? '#eef1ee' : '#fff'} stroke={n.closed ? '#a3aca6' : '#648b76'} strokeWidth="3" strokeDasharray={n.closed ? '4 3' : undefined} />
-          {n.closed && <path d={`M ${px(p.x) - 5} ${py(p.y) - 5} l 10 10 M ${px(p.x) + 5} ${py(p.y) - 5} l -10 10`} stroke="#8d968f" strokeWidth="2" strokeLinecap="round" />}
+          <circle className="map-node-hit" cx={px(p.x)} cy={py(p.y)} r="14" fill="transparent" stroke="none" />
+          <circle className="map-node-dot" cx={px(p.x)} cy={py(p.y)} r="5" fill={selectedNodes.includes(n.id) ? '#244b3d' : n.closed ? '#eef1ee' : '#fff'} stroke={n.closed ? '#a3aca6' : '#648b76'} strokeWidth="1.5" strokeDasharray={n.closed ? '2 1.5' : undefined} />
+          {n.closed && <path d={`M ${px(p.x) - 2.5} ${py(p.y) - 2.5} l 5 5 M ${px(p.x) + 2.5} ${py(p.y) - 2.5} l -5 5`} stroke="#8d968f" strokeWidth="1" strokeLinecap="round" />}
           <title>{n.label} · {kindName[n.kind]}{n.closed ? ' · 이 층 운영 중단' : ''}</title>
         </g> : n.kind !== 'corridor' && !n.closed && !floorImage ? <g key={n.id} transform={keep(px(p.x), py(p.y))}><text x={px(p.x)} y={py(p.y) + 54} textAnchor="middle" fontSize="16" fontWeight="600" fill="#4f5f55">{n.kind === 'stairs' ? '계단 ↕' : '승강기 ↕'}</text></g> : null;
       })}
@@ -241,7 +243,7 @@ export default function MapView({ workspace: s, floor, routes = [], selectedBin,
       })}</g>}
       {/* the floor name and the scale stay put while the drawing is zoomed; the scale shows what 90 drawing units now cover */}
       <g transform={`translate(${left} ${top}) scale(${1 / view.scale})`} pointerEvents="none">
-        <text x="28" y="30" fill="#4f5f55" fontSize="15" fontWeight="700">{floor}F FLOOR PLAN{zoomed ? ` · ${Math.round(view.scale * 100)}%` : ''}</text>
+        <text x="28" y="30" fill="#4f5f55" fontSize="15" fontWeight="700">{floorLabel(floor, true)} FLOOR PLAN{zoomed ? ` · ${Math.round(view.scale * 100)}%` : ''}</text>
         <g transform="translate(845,538)"><line x1="0" y1="0" x2="90" y2="0" stroke="#6f7c73" /><line x1="0" y1="-4" x2="0" y2="4" stroke="#6f7c73" /><line x1="90" y1="-4" x2="90" y2="4" stroke="#6f7c73" /><text x="45" y="-8" textAnchor="middle" fontSize="14" fill="#5f6c64">{+(10 * s.building.meters_per_unit / view.scale).toFixed(1)}m</text></g>
       </g>
     </svg>
@@ -251,5 +253,6 @@ export default function MapView({ workspace: s, floor, routes = [], selectedBin,
       <button type="button" aria-label="축소" title="축소 (Ctrl + 휠)" disabled={!zoomed} onClick={() => zoomBy(1 / 1.5)}><ZoomOut aria-hidden="true" size={16} /></button>
       <button type="button" aria-label="전체 보기" title="전체 보기" disabled={!zoomed} onClick={() => setView({ scale: 1, cx: 500, cy: 280 })}><Maximize2 aria-hidden="true" size={14} /></button>
     </div>
+    {s.building.layout_note && <p className="map-layout-note" role="note">{s.building.layout_note}</p>}
   </div>;
 }

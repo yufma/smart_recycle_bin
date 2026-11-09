@@ -4,9 +4,10 @@ import type { CSSProperties, ReactNode } from 'react';
 import { Leaf, X, ArrowUpRight, Inbox } from 'lucide-react';
 import { compartmentName, compartments, dateTime, fillStatus, statusColor, statusText } from './types';
 import type { Bin, Building, Fills, Status } from './types';
+import { floorLabel, floorsOf } from './floors';
 
-export function Logo({ light = false }: { light?: boolean }) {
-  return <div className={`brand ${light ? 'light' : ''}`}><span className="brand-symbol"><Leaf aria-hidden="true" size={25} strokeWidth={1.7} /></span><span>reloop<span className="brand-dot">.</span></span></div>;
+export function Logo({ light = false, onHome }: { light?: boolean; onHome?: () => void }) {
+  return <a className={`brand ${light ? 'light' : ''}`} href="#dashboard" aria-label="inloop 홈으로 이동" onClick={onHome ? e => { e.preventDefault(); onHome(); } : undefined}><span className="brand-symbol"><Leaf aria-hidden="true" size={25} strokeWidth={1.7} /></span><span>inloop<span className="brand-dot">.</span></span></a>;
 }
 export function Badge({ status }: { status: Status }) { return <span className={`status-badge ${status}`}><i />{statusText[status]}</span>; }
 export function BinArt({ fill, status = 'normal', large = false }: { fill: number | null; status?: Status; large?: boolean }) {
@@ -22,8 +23,8 @@ export function SensorNotice({ bin, details = false }: { bin: Bin; details?: boo
   if (bin.reading_source !== 'actual' || (!bin.partial_reading && !bin.stale_compartments?.length)) return null;
   return <div className="sensor-notice" role="note"><span>{bin.partial_reading ? '일부 칸 수신 대기 · 최신 값만 반영' : '최신 칸 값 수신 대기'}</span>{details && !!bin.stale_compartments?.length && <p>이전 기록(계산에서 제외): {bin.stale_compartments.map(c => `${compartmentName[c]} ${bin.last_compartments?.[c] ?? '—'}% · ${dateTime(bin.compartment_measured_at?.[c] ?? null)}`).join(' / ')}</p>}</div>;
 }
-export function FloorTabs({ value, floors, onChange, all = false }: { value: number; floors: number; onChange: (n: number) => void; all?: boolean }) {
-  return <div className="floor-tabs" role="group" aria-label="층 선택">{all && <button aria-pressed={value === 0} className={value === 0 ? 'active' : ''} onClick={() => onChange(0)}>전체 층</button>}{Array.from({ length: floors }, (_, i) => i + 1).map(f => <button key={f} aria-label={`${f}층`} aria-pressed={value === f} className={value === f ? 'active' : ''} onClick={() => onChange(f)}>{f}F</button>)}</div>;
+export function FloorTabs({ value, floors, basementFloors = 0, onChange, all = false }: { value: number; floors: number; basementFloors?: number; onChange: (n: number) => void; all?: boolean }) {
+  return <div className="floor-tabs" role="group" aria-label="층 선택">{all && <button aria-pressed={value === 0} className={value === 0 ? 'active' : ''} onClick={() => onChange(0)}>전체 층</button>}{floorsOf({ floors, basement_floors: basementFloors }).map(f => <button key={f} aria-label={floorLabel(f)} aria-pressed={value === f} className={value === f ? 'active' : ''} onClick={() => onChange(f)}>{floorLabel(f, true)}</button>)}</div>;
 }
 export function Toggle({ checked, onChange, label, disabled = false }: { checked: boolean; onChange: (v: boolean) => void; label: string; disabled?: boolean }) {
   return <label className="toggle-label"><input type="checkbox" checked={checked} onChange={e => onChange(e.target.checked)} disabled={disabled} /><span className="toggle-track"><span /></span><span>{label}</span></label>;

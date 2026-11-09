@@ -2,18 +2,19 @@ export type Page = 'dashboard' | 'map' | 'team' | 'history' | 'device' | 'settin
 export type Status = 'normal' | 'warning' | 'critical' | 'offline' | 'pending';
 export type RouteMode = 'fastest' | 'lean';
 export interface User { id: number; name: string; email: string }
-export interface BuildingSummary { id: number; name: string; floors: number; bin_count: number; updated_at: string; deleted_at: string | null }
+export interface BuildingSummary { id: number; name: string; floors: number; basement_floors?: number; bin_count: number; updated_at: string; deleted_at: string | null }
 export interface BuildingContext { user: User; buildings: BuildingSummary[]; deleted_buildings: BuildingSummary[] }
 export interface EmptyWorkspace extends BuildingContext { workspace_id: null; building: null }
 export type WorkspaceResponse = Workspace | EmptyWorkspace;
 export interface Building {
-  name: string; floors: number; total_staff: number; available_staff: number;
+  name: string; floors: number; basement_floors?: number; layout_note?: string; total_staff: number; available_staff: number;
   include_orange: boolean; route_mode?: RouteMode; meters_per_unit: number; speed_mps: number;
   service_seconds: number; warning_threshold: number; critical_threshold: number; stale_minutes: number;
   stairs_up_seconds?: number; stairs_down_seconds?: number; elevator_wait_seconds?: number; elevator_floor_seconds?: number;
   use_cart?: boolean; cart_capacity?: number; unload_seconds?: number; compartment_seconds?: number; max_work_minutes?: number;
 }
 export interface Bin {
+  collection_version?: string; collection_done?: boolean; collection_completed_at?: string | null;
   id: string; name: string; floor: number; x: number; y: number; access_node: string;
   fill: number | null; compartments: Fills; pending_compartments?: Compartment[]; device_type: 'real' | 'demo';
   last_compartments?: Fills; compartment_measured_at?: Partial<Record<Compartment, string>>;
@@ -33,6 +34,7 @@ export interface Route {
   start?: string; sequence?: string[]; drops?: number; over_limit?: boolean;
 }
 export interface Plan {
+  id?: string; completed_bin_ids?: string[]; completed_workers?: { worker: number; completed_at: string }[];
   created_at: string; signature: string; include_orange: boolean; available_staff: number; mode?: RouteMode;
   routes: Route[]; target_ids: string[]; unreachable: string[]; unassigned: string[];
   total_distance_m: number; makespan_seconds: number; method: string; outdated: boolean;
@@ -47,7 +49,7 @@ export interface CollectionLog {
 export interface Reading { bin_id: string; fill: number | null; fills?: Partial<Fills> | null; source: string; at: string }
 export interface Workspace extends BuildingContext {
   workspace_id: number;
-  user: User; building: Building; bins: Bin[]; graph: Graph; map_images: Record<string, string>;
+  user: User; building: Building; bins: Bin[]; graph: Graph; map_images: Record<string, string>; map_image_urls?: Record<string, string>;
   logs: CollectionLog[]; readings: Reading[]; last_plan: Plan | null; device_key_hint: string | null;
   revision: number; updated_at: string;
 }
@@ -86,6 +88,7 @@ export function duration(seconds: number) {
   return seconds < 60 ? `${Math.round(seconds)}초` : `${Math.floor(seconds / 60)}분 ${Math.round(seconds % 60)}초`;
 }
 export async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
+  if (window.inloopDemoApi) return window.inloopDemoApi<T>(path, options);
   const controller = new AbortController();
   const timer = window.setTimeout(() => controller.abort(), 30000);
   try {

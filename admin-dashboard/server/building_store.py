@@ -63,6 +63,7 @@ def summaries(db, user_id, *, deleted=False):
     for row in rows:
         state = json.loads(row['state_json'])
         results.append({'id': row['id'], 'name': state['building']['name'], 'floors': state['building']['floors'],
+                        'basement_floors': state['building'].get('basement_floors', 0),
                         'bin_count': len(state['bins']), 'updated_at': state['updated_at'], 'deleted_at': row['deleted_at']})
     return results
 
