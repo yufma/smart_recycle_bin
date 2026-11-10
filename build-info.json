@@ -2,5 +2,7 @@
   "app": "inloop",
   "source_commit": "483d9231f9aea812ce47bb61b1b484b85cba6881",
   "source_branch": "main",
-  "storage": "independent browser data"
+  "storage": "independent browser data",
+  "frontend_change": "B-001 AI classification results from the PC photo server (src/Classifier.tsx, not yet in main)",
+  "public_demo_bundle": "unchanged from 483d923 deploy"
 }
